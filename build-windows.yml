@@ -1,19 +1,84 @@
-name: Build Windows EXE
+name: Build SAM3 Image Segmenter
 
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
   build:
-    runs-on: windows-latest
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            platform: Windows
+            artifact: SAM3-Windows-EXE
+            icon: icon.ico
+          - os: macos-latest
+            platform: macOS
+            artifact: SAM3-macOS-APP
+            icon: icon.icns
+
+    runs-on: ${{ matrix.os }}
+    name: Build ${{ matrix.platform }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install segment-anything
+          pip install tkinterdnd2
+          pip install pyinstaller
+          pip install pillow
+
+      - name: Generate icon
+        run: python generate_icon.py
+
+      - name: Build with PyInstaller
+        run: pyinstaller SAM3ImageSegmenter.spec
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/SAM3ImageSegmenter*
+          retention-days: 30
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    name: Create Release
+
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: SAM3-Windows-EXE
+          path: ./windows
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: SAM3-macOS-APP
+          path: ./macos
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ./windows/SAM3ImageSegmenter.exe
+            ./macos/SAM3ImageSegmenter.app/**/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
