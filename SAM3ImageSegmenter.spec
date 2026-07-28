@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 # SAM3 Image Segmenter - PyInstaller spec file
+# Supports Windows (.ico) and macOS (.icns)
 
 import os
 import sys
@@ -12,6 +13,12 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 torch_hiddenimports = collect_submodules('torch')
 sam_hiddenimports = collect_submodules('segment_anything')
 dnd_hiddenimports = collect_submodules('tkinterdnd2')
+
+# Select icon based on platform
+if sys.platform == 'darwin':
+    icon_file = 'icon.icns'
+else:
+    icon_file = 'icon.ico'
 
 a = Analysis(
     ['main.py'],
@@ -69,5 +76,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='icon.ico',
+    icon=icon_file,
 )
