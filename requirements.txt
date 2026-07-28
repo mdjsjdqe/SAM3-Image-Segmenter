@@ -1,0 +1,5 @@
+numpy
+Pillow
+tkinterdnd2
+torch
+segment-anything
