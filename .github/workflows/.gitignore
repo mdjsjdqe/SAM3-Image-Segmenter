@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# PyInstaller
+*.spec.bak
+*.manifest
+*.exe
+*.app
+*.dmg
+
+# SAM model weights
+*.pth
+*.pt
+sam_vit_*.pth
+
+# Generated icons
+icon.ico
+icon.icns
+icon.png
+
+# Runtime
+sam3_segmenter.log
+session.json
+*.sam3proj
+
+# IDE
+.vscode/
+.idea/
