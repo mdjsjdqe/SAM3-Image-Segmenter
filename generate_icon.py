@@ -1,252 +1,207 @@
+#!/usr/bin/env python3
 """
-SAM3 Image Segmenter - 图标生成脚本
-使用 Pillow 生成 macOS .icns 图标文件
+SAM3 Image Segmenter — 应用图标生成器
+生成 icon.ico（Windows）和 icon.icns（macOS）用于 PyInstaller 打包
 
-macOS .icns 格式需要以下尺寸的图标：
-16x16, 32x32, 64x64, 128x128, 256x256, 512x512, 1024x1024
-
-使用方法:
-    python generate_icon.py
-    → 输出: icon.icns (macOS 图标)
-    → 输出: icon_preview.png (预览图)
+图标设计：蓝色圆形背景 + 白色 SAM（Segment Anything Model）剪影
 """
 
 import os
+import sys
 import struct
-from PIL import Image, ImageDraw, ImageFont
 
-
-def _find_font(size: int) -> ImageFont.FreeTypeFont:
-    """
-    查找可用的 TrueType 字体
-    按优先级尝试多个路径，确保在所有 macOS 版本上都能找到有效字体
-    """
-    # macOS 系统字体候选列表（按优先级排序）
-    font_candidates = [
-        "/System/Library/Fonts/Helvetica.ttc",
-        "/System/Library/Fonts/SFNSDisplay.ttf",
-        "/System/Library/Fonts/SFNSText.ttf",
-        "/System/Library/Fonts/Geneva.ttf",
-        "/System/Library/Fonts/Monaco.ttf",
-        "/System/Library/Fonts/SFCompact.ttf",
-        "/Library/Fonts/Arial.ttf",
-        "/Library/Fonts/Helvetica.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    ]
-
-    for font_path in font_candidates:
-        if os.path.exists(font_path):
-            try:
-                font = ImageFont.truetype(font_path, size)
-                # 验证字体可用：尝试获取 bbox
-                font.getbbox("S3")
-                return font
-            except (OSError, IOError, Exception):
-                continue
-
-    # 所有 TrueType 字体都失败，使用 load_default 但设置 size
-    # Pillow >= 10.1 支持 load_default(size=)
-    try:
-        font = ImageFont.load_default(size=size)
-        font.getbbox("S3")
-        return font
-    except (TypeError, OSError, AttributeError, Exception):
-        pass
-
-    # 最终回退：load_default() 无参数
-    try:
-        font = ImageFont.load_default()
-        # 默认字体可能很小，手动缩放
-        return font
-    except Exception:
-        pass
-
-    # 绝对不可能到这里，但以防万一
-    raise RuntimeError("无法加载任何字体，请检查 Pillow 安装")
-
-
-def create_icon_image(size: int) -> Image.Image:
-    """
-    生成 SAM3 图标图像
-    设计：圆角矩形背景 + 分割区域图案 + "S3" 文字
-    """
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-
-    # 圆角矩形背景 - 渐变蓝紫色
-    radius = size // 5
-    border = max(1, size // 64)
-    outer_rect = [border, border, size - border - 1, size - border - 1]
-    if outer_rect[2] > outer_rect[0] and outer_rect[3] > outer_rect[1]:
-        draw.rounded_rectangle(
-            outer_rect,
-            radius=radius,
-            fill=(45, 55, 120, 255),  # 深蓝紫
-        )
-    # 内层圆角矩形（渐变效果 - 用两层模拟）
-    inset = max(2, size // 32)
-    inner_rect = [inset, inset, size - inset - 1, size - inset - 1]
-    if inner_rect[2] > inner_rect[0] and inner_rect[3] > inner_rect[1]:
-        draw.rounded_rectangle(
-            inner_rect,
-            radius=max(1, radius - inset // 2),
-            fill=(65, 85, 180, 255),  # 蓝紫
-        )
-    # 最内层（高光）
-    inner = max(4, size // 16)
-    highlight_rect = [inner, inner, size - inner - 1, size * 2 // 3]
-    if highlight_rect[2] > highlight_rect[0] and highlight_rect[3] > highlight_rect[1]:
-        draw.rounded_rectangle(
-            highlight_rect,
-            radius=max(1, radius - inner),
-            fill=(85, 110, 210, 80),  # 半透明高光
-        )
-
-    # 分割线图案（对角虚线 + 多边形片段）
-    line_width = max(2, size // 32)
-    # 主对角线
-    draw.line(
-        [(size * 2 // 10, size * 8 // 10), (size * 8 // 10, size * 2 // 10)],
-        fill=(255, 255, 255, 200),
-        width=line_width,
+def generate_icon_ico(output_path="icon.ico", size=256):
+    """生成 Windows .ico 格式图标（纯代码绘制，无需 Pillow）"""
+    
+    # ── 用 BMP 数据生成图标 ──
+    # ICO 文件格式：ICONDIR + ICONDIRENTRY + BMP 数据
+    
+    width = size
+    height = size
+    
+    # 生成像素数据（BGRA 格式，从下到上）
+    pixels = []
+    cx, cy = width // 2, height // 2
+    r_outer = width // 2 - 4  # 外圆半径（留边距）
+    r_inner = width // 4      # 内圆（SAM 中心标记）
+    
+    for y in range(height):
+        row = []
+        for x in range(width):
+            # 距离中心
+            dx = x - cx
+            dy = y - cy
+            dist = (dx * dx + dy * dy) ** 0.5
+            
+            # 背景透明
+            if dist > r_outer:
+                row.append((0, 0, 0, 0))  # BGRA: 透明
+            # 外圆：蓝色渐变
+            elif dist > r_inner + 8:
+                # 蓝色渐变（从深蓝到浅蓝）
+                t = (dist - r_inner - 8) / (r_outer - r_inner - 8)
+                b = int(40 + t * 80)    # Blue: 40→120
+                g = int(80 + t * 40)    # Green: 80→120  
+                r = int(20 + t * 30)    # Red: 20→50
+                a = 255
+                row.append((b, g, r, a))  # BGRA
+            # 内圆：白色
+            elif dist > r_inner - 2:
+                row.append((255, 255, 255, 255))  # BGRA: 白色
+            # 中心：深蓝色
+            else:
+                row.append((120, 100, 40, 255))  # BGRA: 深蓝
+            
+        pixels.append(row)
+    
+    # BMP 数据（从下到上存储）
+    bmp_data = b''
+    for row in reversed(pixels):
+        for b, g, r, a in row:
+            bmp_data += struct.pack('BBBB', b, g, r, a)
+    
+    # AND mask（全0 = 不透明）
+    and_mask = b'\x00' * ((width + 31) // 32 * 4 * height)
+    
+    # ── ICO 文件结构 ──
+    # ICONDIR (6 bytes)
+    icondir = struct.pack('<HHH', 0, 1, 1)  # Reserved, Type=ICO, Count=1
+    
+    # ICONDIRENTRY (16 bytes)
+    image_data = bmp_data + and_mask
+    bmp_header = struct.pack('<IiiHHIIiiII',
+        40,  # biSize (BITMAPINFOHEADER)
+        width,  # biWidth
+        height * 2,  # biHeight (2x because AND mask is included)
+        1,  # biPlanes
+        32,  # biBitCount (BGRA)
+        0,  # biCompression (BI_RGB)
+        len(bmp_data),  # biSizeImage
+        0,  # biXPelsPerMeter
+        0,  # biYPelsPerMeter
+        0,  # biClrUsed
+        0,  # biClrImportant
     )
-    # 上方三角片段（被分割出的部分）
-    tri_margin = size // 6
-    draw.polygon(
-        [
-            (tri_margin, tri_margin),
-            (size - tri_margin, tri_margin),
-            (size - tri_margin, size // 3),
-        ],
-        fill=(0, 220, 180, 160),  # 青绿色 - 分割区域
+    
+    entry_data = bmp_header + image_data
+    entry_offset = 6 + 16  # ICONDIR + ICONDIRENTRY
+    
+    icondirentry = struct.pack('<BBBBHHII',
+        0 if width >= 256 else width,   # Width (0 = 256+)
+        0 if height >= 256 else height,  # Height (0 = 256+)
+        0,  # ColorCount
+        0,  # Reserved
+        1,  # Planes
+        32, # BitCount
+        len(entry_data),  # SizeInBytes
+        entry_offset,     # FileOffset
     )
-    # 下方三角片段
-    draw.polygon(
-        [
-            (tri_margin, size - tri_margin),
-            (tri_margin, size * 2 // 3),
-            (size - tri_margin, size - tri_margin),
-        ],
-        fill=(255, 180, 50, 160),  # 橙色 - 另一个分割区域
-    )
+    
+    ico_data = icondir + icondirentry + entry_data
+    
+    with open(output_path, 'wb') as f:
+        f.write(ico_data)
+    
+    print(f"[OK] Windows icon generated: {output_path} ({len(ico_data)} bytes)")
 
-    # "S3" 文字
-    font_size = size // 3
-    font = _find_font(font_size)
 
-    text = "S3"
-    # 安全获取文字尺寸
+def generate_icon_png(output_path="icon.png", size=256):
+    """生成 PNG 格式图标（用于 Linux 和 macOS icns 转换）"""
     try:
-        bbox = draw.textbbox((0, 0), text, font=font)
-        text_w = bbox[2] - bbox[0]
-        text_h = bbox[3] - bbox[1]
-    except (OSError, Exception):
-        # textbbox 失败时使用 font.getbbox
+        from PIL import Image, ImageDraw
+        
+        img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        
+        cx, cy = size // 2, size // 2
+        r_outer = size // 2 - 4
+        r_inner = size // 4
+        
+        # 外圆：蓝色渐变
+        for r in range(r_outer, r_inner + 8, -1):
+            t = (r - r_inner - 8) / (r_outer - r_inner - 8)
+            color = (int(20 + t * 30), int(80 + t * 40), int(40 + t * 80), 255)
+            draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=color)
+        
+        # 内圆：白色
+        draw.ellipse([cx - r_inner, cy - r_inner, cx + r_inner, cy + r_inner], fill=(255, 255, 255, 255))
+        
+        # 中心：深蓝
+        r_center = r_inner - 2
+        draw.ellipse([cx - r_center, cy - r_center, cx + r_center, cy + r_center], fill=(40, 100, 120, 255))
+        
+        # SAM 文字（如果字体可用）
         try:
-            bbox = font.getbbox(text)
-            text_w = bbox[2] - bbox[0]
-            text_h = bbox[3] - bbox[1]
-        except (OSError, Exception):
-            # 最终回退：估算尺寸
-            text_w = font_size * len(text) * 2 // 3
-            text_h = font_size
-
-    text_x = (size - text_w) // 2
-    text_y = (size - text_h) // 2
-
-    # 文字阴影
-    shadow_offset = max(1, size // 64)
-    try:
-        draw.text(
-            (text_x + shadow_offset, text_y + shadow_offset),
-            text, fill=(0, 0, 0, 120), font=font,
-        )
-        # 文字主体
-        draw.text(
-            (text_x, text_y),
-            text, fill=(255, 255, 255, 240), font=font,
-        )
-    except (OSError, Exception):
-        # 字体渲染失败时跳过文字，只保留图形
-        pass
-
-    return img
+            draw.text((cx - 30, cy - 15), "SAM", fill=(255, 255, 255, 255), font=None)
+        except Exception:
+            pass
+        
+        img.save(output_path, 'PNG')
+        print(f"[OK] PNG icon generated: {output_path}")
+        
+    except ImportError:
+        print("[WARN] Pillow not installed, PNG icon generation skipped")
 
 
-def create_icns(sizes_dict: dict, output_path: str):
-    """
-    将多尺寸 PNG 图标打包为 macOS .icns 文件
-
-    .icns 文件格式:
-    - 文件头: 'icns' + 4字节文件总大小
-    - 图标数据: 类型标识 + 4字节块大小 + 像素数据
-    """
-    # macOS .icns 图标类型映射
-    ICNS_TYPES = {
-        16: "icp4",    # 16x16
-        32: "ic11",    # 16x16@2x / 32x32
-        64: "ic12",    # 32x32@2x / 64x64
-        128: "icp6",   # 128x128
-        256: "ic08",   # 256x256
-        512: "ic07",   # 512x512
-        1024: "ic09",  # 512x512@2x / 1024x1024
-    }
-
-    icns_data = b""
-
-    for size, icon_type in sorted(ICNS_TYPES.items()):
-        if size in sizes_dict:
-            png_data = sizes_dict[size]
-            type_bytes = icon_type.encode("ascii")
-            block_size = len(png_data) + 8
-            icns_data += type_bytes + struct.pack(">I", block_size) + png_data
-
-    file_size = len(icns_data) + 8
-    with open(output_path, "wb") as f:
-        f.write(b"icns")
-        f.write(struct.pack(">I", file_size))
-        f.write(icns_data)
-
-    print(f"✅ 图标已保存: {output_path} ({os.path.getsize(output_path):,} bytes)")
-
-
-def main():
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    output_dir = script_dir
-
-    # 生成各尺寸图标
-    sizes = [16, 32, 64, 128, 256, 512, 1024]
-    sizes_dict = {}
-
-    print("🎨 生成 SAM3 Image Segmenter 图标...")
-    for size in sizes:
-        img = create_icon_image(size)
-        png_path = os.path.join(output_dir, f"icon_{size}x{size}.png")
-        img.save(png_path, "PNG")
-        with open(png_path, "rb") as f:
-            sizes_dict[size] = f.read()
-        print(f"  ✅ {size}x{size}")
-
-    # 生成 .icns
-    icns_path = os.path.join(output_dir, "icon.icns")
-    create_icns(sizes_dict, icns_path)
-
-    # 生成预览图（512x512）
-    preview = create_icon_image(512)
-    preview_path = os.path.join(output_dir, "icon_preview.png")
-    preview.save(preview_path, "PNG")
-    print(f"✅ 预览图已保存: {preview_path}")
-
-    # 清理临时 PNG 文件
-    for size in sizes:
-        png_path = os.path.join(output_dir, f"icon_{size}x{size}.png")
-        if os.path.exists(png_path):
-            os.remove(png_path)
-
-    print(f"\n🎉 图标生成完成！")
-    print(f"   📱 macOS 图标: {icns_path}")
-    print(f"   🖼️  预览图: {preview_path}")
+def generate_icon_icns(output_path="icon.icns"):
+    """生成 macOS .icns 格式图标（依赖 Pillow + png2icns 或 sips）"""
+    # macOS 上可用 sips 命令从 PNG 生成 icns
+    if sys.platform == 'darwin':
+        png_path = "icon.png"
+        generate_icon_png(png_path)
+        
+        iconset_dir = "icon.iconset"
+        os.makedirs(iconset_dir, exist_ok=True)
+        
+        sizes = {
+            'icon_16x16.png': 16,
+            'icon_16x16@2x.png': 32,
+            'icon_32x32.png': 32,
+            'icon_32x32@2x.png': 64,
+            'icon_128x128.png': 128,
+            'icon_128x128@2x.png': 256,
+            'icon_256x256.png': 256,
+            'icon_256x256@2x.png': 512,
+            'icon_512x512.png': 512,
+            'icon_512x512@2x.png': 1024,
+        }
+        
+        try:
+            from PIL import Image
+            base_img = Image.open(png_path)
+            for name, sz in sizes.items():
+                resized = base_img.resize((sz, sz), Image.LANCZOS)
+                resized.save(os.path.join(iconset_dir, name), 'PNG')
+            
+            # 使用 sips 或 iconutil 生成 icns
+            os.system(f'iconutil -c icns {iconset_dir} -o {output_path}')
+            
+            # 清理临时文件
+            import shutil
+            shutil.rmtree(iconset_dir, ignore_errors=True)
+            
+            if os.path.exists(output_path):
+                print(f"[OK] macOS icon generated: {output_path}")
+            else:
+                print("[WARN] icns generation failed, will use PNG as icon")
+        except ImportError:
+            print("[WARN] Pillow not installed, skipping icns icon generation")
+    else:
+        print("[WARN] Non-macOS system, skipping icns icon generation")
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    import sys
+    import io
+    # Fix Windows cp1252 encoding issue in GitHub Actions
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    
+    print("=== SAM3 Image Segmenter Icon Generator ===")
+    
+    # Generate all icon formats
+    generate_icon_ico("icon.ico")     # Windows
+    generate_icon_png("icon.png")     # Linux / General
+    generate_icon_icns("icon.icns")   # macOS
+    
+    print("")
+    print("Icon files generated, ready for PyInstaller packaging")
