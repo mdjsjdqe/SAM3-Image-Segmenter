@@ -1,0 +1,48 @@
+Last login: Mon Jul 27 13:21:16 on ttys000
+Downloads [master] % ls
+#357_W1_Mag_100x_measurements.csv      TG FACA Team Roster.xlsx
+C-NAS使用教程.pptx                     Unconfirmed 989681.crdownload
+ImageJ Plugins                         build-windows.yml
+LIMS.jpeg                              build.sh
+MMH simulation.pptx                    feishu skills
+Python TK Apps                         from Internet
+Rel                                    generate_icon.py
+Root_Cause_Map_Guidance_v10.pdf        gitignore
+SAM3 Examples                          requirements.txt
+SAM3ImageSegmenter.spec                报工操作手册-新工时系统.pdf
+Swift Native Apps                      模型权重文件
+Downloads [master] % nano ./build-windows.yml 
+
+
+
+
+
+
+
+
+
+
+  UW PICO 5.09                   File: ./build-windows.yml                      
+
+name: Build Windows EXE
+
+on:
+  push:
+    tags: ['v*']           # 推送 v1.0.0 等标签时自动触发
+  workflow_dispatch:        # 也支持手动触发（Actions 页面点击 Run workflow）
+
+permissions:
+  contents: write          # 允许创建 Release
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+
+^G Get Help  ^O WriteOut  ^R Read File ^Y Prev Pg   ^K Cut Text  ^C Cur Pos   
+^X Exit      ^J Justify   ^W Where is  ^V Next Pg   ^U UnCut Text^T To Spell  
