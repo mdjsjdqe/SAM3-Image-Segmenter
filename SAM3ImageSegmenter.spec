@@ -16,6 +16,7 @@ a = Analysis(
     hiddenimports=[
         'sam3_engine',
         'tkinterdnd2',
+        'tkinterdnd2.TkinterDnD',
         'torch',
         'torchvision',
         'segment_anything',
@@ -33,18 +34,13 @@ a = Analysis(
         'notebook',
         'jupyter',
         'tkinter.test',
+        'tensorboard',
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
     noarchive=False,
 )
-
-# Collect torch data and submodules
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
-a.datas += collect_data_files('torch')
-a.datas += collect_data_files('tkinterdnd2')
-a.hiddenimports += collect_submodules('torch')
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
