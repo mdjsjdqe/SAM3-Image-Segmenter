@@ -8,25 +8,10 @@ block_cipher = None
 
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
-# Collect data files and ensure 3-tuple format (dest, src, typecode)
-def safe_collect_data(package):
-    result = []
-    for item in collect_data_files(package):
-        if len(item) == 2:
-            result.append((item[0], item[1], 'DATA'))
-        else:
-            result.append(item)
-    return result
-
-# Collect all submodules
+# Collect submodules
 torch_hiddenimports = collect_submodules('torch')
 sam_hiddenimports = collect_submodules('segment_anything')
 dnd_hiddenimports = collect_submodules('tkinterdnd2')
-
-# Collect all data files
-torch_datas = safe_collect_data('torch')
-sam_datas = safe_collect_data('segment_anything')
-dnd_datas = safe_collect_data('tkinterdnd2')
 
 a = Analysis(
     ['main.py'],
@@ -34,7 +19,7 @@ a = Analysis(
     binaries=[],
     datas=[
         ('sam3_engine.py', '.'),
-    ] + torch_datas + sam_datas + dnd_datas,
+    ] + collect_data_files('torch') + collect_data_files('segment_anything') + collect_data_files('tkinterdnd2'),
     hiddenimports=[
         'sam3_engine',
         'tkinterdnd2',
