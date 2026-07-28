@@ -3,3 +3,4 @@ Pillow
 tkinterdnd2
 torch
 segment-anything
+ultralytics
