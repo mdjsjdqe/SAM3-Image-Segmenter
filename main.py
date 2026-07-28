@@ -31,6 +31,7 @@ except ImportError:
 def setup_logging():
     import os
     import tempfile
+    import logging
 
     if os.name == 'nt':
         log_dir = os.path.join(os.environ.get('APPDATA', tempfile.gettempdir()), 'SAM3ImageSegmenter')
@@ -40,6 +41,17 @@ def setup_logging():
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, 'sam3_segmenter.log')
 
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler()
+        ]
+    )
+    logger = logging.getLogger('SAM3ImageSegmenter')
+    logger.info(f"Log file: {log_file}")
+    return logger   # ← 关键！必须有这行
 
 # ── PyInstaller 打包适配 ──
 def resource_path(relative_path: str) -> str:
