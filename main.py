@@ -29,19 +29,16 @@ except ImportError:
 
 # ── 日志配置 ──
 def setup_logging():
-    """配置日志，输出到文件和控制台"""
-    log_dir = app_base_dir()
-    log_path = os.path.join(log_dir, "sam3_segmenter.log")
+    import os
+    import tempfile
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[
-            logging.FileHandler(log_path, encoding="utf-8"),
-            logging.StreamHandler(),
-        ],
-    )
-    return logging.getLogger("SAM3App")
+    if os.name == 'nt':
+        log_dir = os.path.join(os.environ.get('APPDATA', tempfile.gettempdir()), 'SAM3ImageSegmenter')
+    else:
+        log_dir = os.path.join(os.path.expanduser('~'), '.sam3_segmenter')
+
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, 'sam3_segmenter.log')
 
 
 # ── PyInstaller 打包适配 ──
