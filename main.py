@@ -204,7 +204,7 @@ class SAM3App:
 
     # 应用标题和版本
     APP_TITLE = "SAM3 Image Segmenter"
-    APP_VERSION = "1.5.0"
+    APP_VERSION = "1.7.0"
 
     # 画布最大尺寸
     CANVAS_MAX_W = 900
@@ -299,6 +299,27 @@ class SAM3App:
         # 结果计数变量（在 __init__ 中提前创建，避免 _build_ui 时 AttributeError）
         self.result_count_var = tk.StringVar(value="累计分割: 0 个区域")
 
+        # ── 测量模块状态 ──
+        self.measurement_mode = tk.StringVar(value="length")  # 默认选择长度测量
+        self._label_drag_data = None  # 标注拖拽状态: {"measure_id": id, "label_id": cid, "start_x": x, "start_y": y}
+        self.measure_points = []          # 当前测量中的点列表 [{canvas_xy, img_xy}, ...]
+        self.measure_point_canvas_ids = []  # 当前测量中的点画布 ID
+        self.measure_line_canvas_ids = []   # 当前测量中的线段画布 ID
+        self.measure_label_canvas_ids = []  # 当前测量中的标注文字画布 ID
+        self.fit_circle_preview_ids = []   # 拟合圆预览画布元素 ID（临时）
+        self.fit_circle_preview_data = None  # 拟合圆预览数据 {img_cx, img_cy, img_r}
+        self.measurements = []             # 已完成的测量记录 [{id, type, name, points, value, value_unit, canvas_ids, visible}, ...]
+        self.measure_counter = 0           # 测量编号计数器
+        # self._fit_circle_dialog 拟合圆完成弹窗（动态创建）
+        self._fit_circle_dialog = None
+        self._polyline_dialog = None  # 多段线完成弹窗（动态创建）
+        self.measure_drag_line_id = None   # 测量拖拽中的临时线段画布 ID
+        self.measure_drag_label_id = None  # 测量拖拽中的临时标注画布 ID
+        self.measure_is_dragging = False   # 是否正在拖拽画测量线
+        self.measure_point_dragging = False  # 是否正在拖拽已有测量控制点
+        self.measure_drag_point_idx = None   # 拖拽的控制点索引（测量记录索引，点索引）
+        self.measure_drag_measure_idx = None  # 拖拽的测量记录索引
+
         # 构建 UI
         self._build_ui()
 
@@ -381,16 +402,6 @@ class SAM3App:
         self.model_btn = ttk.Button(toolbar, text="🧠 加载模型", command=self._load_model)
         self.model_btn.pack(side=tk.LEFT, padx=2)
         self._add_tooltip(self.model_btn, "加载 SAM3 模型文件 (.pt)\n支持 sam2.1_l / sam3 模型")
-
-        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6, pady=2)
-
-        ttk.Label(toolbar, text="ROI生成模式:").pack(side=tk.LEFT, padx=(4, 2))
-        for text, mode in [("🖱️ 点击ROI", "point"), ("✏️ 框选ROI", "box")]:
-            rb = ttk.Radiobutton(
-                toolbar, text=text, variable=self.prompt_mode, value=mode,
-                command=self._on_prompt_mode_change
-            )
-            rb.pack(side=tk.LEFT, padx=2)
 
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6, pady=2)
 
@@ -539,6 +550,9 @@ class SAM3App:
 
         # 绑定鼠标事件
         self.canvas.bind("<Button-1>", self._on_canvas_click)
+        self.canvas.bind("<ButtonPress-3>", self._on_label_drag_start)  # 右键开始拖拽标注
+        self.canvas.bind("<B3-Motion>", self._on_label_drag_motion)     # 右键拖拽标注
+        self.canvas.bind("<ButtonRelease-3>", self._on_label_drag_end)  # 右键结束拖拽标注
         self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
         self.canvas.bind("<Button-2>", self._on_canvas_right_click)  # macOS 右键=Button-2, 负提示
@@ -765,7 +779,7 @@ class SAM3App:
         ttk.Button(box_frame, text="🔍 执行分割（选中 ROI）", command=self._segment_box).pack(
             fill=tk.X, pady=(12, 4))
 
-        # ---- Tab 4: Mask结果 ----
+        # ---- Tab 3: Mask结果 ----
         result_frame = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(result_frame, text="📊 Mask结果")
 
@@ -888,6 +902,99 @@ class SAM3App:
             side=tk.LEFT, fill=tk.X, expand=True)
 
 
+        # ---- Tab 4: 尺寸测量 ----
+        measure_frame = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(measure_frame, text="📐 尺寸测量")
+
+        # 测量类型选择（类似框选ROI的形状选择布局）
+        ttk.Label(measure_frame, text="测量工具:", font=("", 10, "bold")).pack(anchor=tk.W)
+        measure_type_frame = ttk.Frame(measure_frame)
+        measure_type_frame.pack(fill=tk.X, pady=4)
+        for text, mode in [("📏 长度", "length"), ("∠ 角度(3点)", "angle"), ("∠ 角度(4点)", "angle_4pt"), ("📏 多段线", "perimeter"), ("⭕ 拟合圆", "fit_circle")]:
+            rb = ttk.Radiobutton(
+                measure_type_frame, text=text, variable=self.measurement_mode, value=mode,
+                command=self._on_measurement_type_change
+            )
+            rb.pack(side=tk.LEFT, padx=4)
+
+        # ── 单位切换区域 ──
+        unit_frame = ttk.Frame(measure_frame)
+        unit_frame.pack(fill=tk.X, pady=4)
+        ttk.Label(unit_frame, text="长度单位:", font=("", 9)).pack(side=tk.LEFT, padx=(4, 2))
+        self.length_unit_var = tk.StringVar(value="px")
+        self.length_unit_combo = ttk.Combobox(
+            unit_frame, textvariable=self.length_unit_var,
+            values=["px", "μm", "mm", "cm", "in"],
+            width=6, state="readonly"
+        )
+        self.length_unit_combo.pack(side=tk.LEFT, padx=2)
+        self.length_unit_combo.bind("<<ComboboxSelected>>", self._on_length_unit_change)
+        ttk.Label(unit_frame, text="角度单位:", font=("", 9)).pack(side=tk.LEFT, padx=(8, 2))
+        self.angle_unit_var = tk.StringVar(value="°")
+        self.angle_unit_combo = ttk.Combobox(
+            unit_frame, textvariable=self.angle_unit_var,
+            values=["°", "rad"],
+            width=6, state="readonly"
+        )
+        self.angle_unit_combo.pack(side=tk.LEFT, padx=2)
+        self.angle_unit_combo.bind("<<ComboboxSelected>>", self._on_angle_unit_change)
+
+        ttk.Separator(measure_frame).pack(fill=tk.X, pady=8)
+
+        # 操作说明（动态）
+        ttk.Label(measure_frame, text="操作说明:", font=("", 9, "bold")).pack(anchor=tk.W)
+        self.measure_help_label = ttk.Label(measure_frame, text="", foreground="blue", wraplength=250, justify=tk.LEFT)
+        self.measure_help_label.pack(anchor=tk.W, pady=2)
+        self._update_measure_help()
+
+        ttk.Separator(measure_frame).pack(fill=tk.X, pady=8)
+
+        # 测量结果列表
+        self.measure_count_var = tk.StringVar(value="累计测量: 0 个")
+        ttk.Label(measure_frame, textvariable=self.measure_count_var, font=("", 11, "bold")).pack(anchor=tk.W, pady=(0, 4))
+
+        ttk.Label(measure_frame, text="测量结果列表（点击可见列切换 / 双击名字编辑）:").pack(anchor=tk.W)
+        self.measure_tree = ttk.Treeview(
+            measure_frame,
+            columns=("id", "name", "type", "value", "vis"),
+            show="headings",
+            height=8,
+        )
+        self.measure_tree.heading("id", text="ID")
+        self.measure_tree.heading("name", text="名字")
+        self.measure_tree.heading("type", text="类型")
+        self.measure_tree.heading("value", text="测量值")
+        self.measure_tree.heading("vis", text="可见")
+        self.measure_tree.column("id", width=40, anchor=tk.CENTER)
+        self.measure_tree.column("name", width=100, anchor=tk.CENTER)
+        self.measure_tree.column("type", width=80, anchor=tk.CENTER)
+        self.measure_tree.column("value", width=130, anchor=tk.CENTER)
+        self.measure_tree.column("vis", width=35, anchor=tk.CENTER)
+        self.measure_tree.pack(fill=tk.BOTH, expand=True, pady=4)
+
+        self.measure_tree.bind("<<TreeviewSelect>>", self._on_measure_select)
+        self.measure_tree.bind("<Double-1>", self._on_measure_double_click)
+        self.measure_tree.bind("<ButtonRelease-1>", self._on_measure_click)
+
+        # 测量操作按钮
+        measure_btn_frame = ttk.Frame(measure_frame)
+        measure_btn_frame.pack(fill=tk.X, pady=4)
+        ttk.Button(measure_btn_frame, text="👁️ 切换选中可见性", command=self._toggle_selected_measure_visibility).pack(
+            side=tk.LEFT, padx=2)
+        ttk.Button(measure_btn_frame, text="❌ 删除选中", command=self._delete_selected_measure).pack(
+            side=tk.LEFT, padx=2)
+        ttk.Button(measure_btn_frame, text="🧹 清空所有", command=self._clear_all_measurements).pack(
+            side=tk.LEFT, padx=2)
+        ttk.Button(measure_btn_frame, text="🙈 隐藏所有", command=self._hide_all_measurements).pack(
+            side=tk.LEFT, padx=2)
+        # 拟合圆完成按钮改为弹窗（不再在此创建按钮）
+
+        ttk.Separator(measure_frame).pack(fill=tk.X, pady=8)
+
+        # 导出测量结果
+        ttk.Button(measure_frame, text="📊 导出测量结果 (CSV)", command=self._export_measurements).pack(
+            fill=tk.X, pady=(4, 4))
+
 
     def _build_statusbar(self):
         """底部状态栏 + 可展开的 log 面板"""
@@ -1009,6 +1116,11 @@ class SAM3App:
         self._clear_prompts()
         # 清除校准数据
         self._clear_calibration()
+        # ── 清除测量结果 ──
+        self.canvas.delete("measurement")
+        self.measurements = []
+        self.measure_counter = 0
+        self._update_measure_tree()
         # 重置缩放
         self.zoom_level = 1.0
         self.zoom_center_img = None
@@ -1083,6 +1195,10 @@ class SAM3App:
         # 重绘所有 ROI（_display_image 会 delete("all")，需要重新绘制）
         if hasattr(self, 'roi_list') and self.roi_list:
             self._redraw_all_rois()
+
+        # 重绘所有测量结果
+        if hasattr(self, 'measurements') and self.measurements:
+            self._redraw_all_measurements()
 
     def _draw_image_info(self):
         """更新顶部栏的图片文件名、大小和缩放倍数信息"""
@@ -1635,7 +1751,10 @@ class SAM3App:
     # ================================================================
 
     def _on_prompt_mode_change(self):
-        """ROI生成模式切换时清除交互状态，并自动切换到对应 Tab"""
+        """ROI生成模式切换时清除交互状态，并自动切换到对应 Tab，同时退出测量模式"""
+        # 切换 ROI 模式时自动退出测量模式
+        self._exit_measurement_mode()
+
         self.is_drawing_box = False
         self.box_start = None
         self.box_end = None
@@ -1652,21 +1771,28 @@ class SAM3App:
             self.notebook.select(1)  # Tab 1: ✏️ 框选ROI模式
 
     def _on_notebook_tab_changed(self, event=None):
-        """当用户点击 Notebook Tab 时，同步更新工具栏的ROI生成模式"""
+        """当用户点击 Notebook Tab 时，同步更新工具栏的ROI生成模式或测量模式"""
         current_tab = self.notebook.index(self.notebook.select())
-        target_mode = "point" if current_tab == 0 else "box"
-        if self.prompt_mode.get() != target_mode:
-            # 同步ROI生成模式（设置 prompt_mode 会触发 radiobutton 更新，
-            # 但不会触发 _on_prompt_mode_change，需手动调用）
-            self.prompt_mode.set(target_mode)
-            # 清除交互状态（不再调用 _on_prompt_mode_change 避免递归 select）
-            self.is_drawing_box = False
-            self.box_start = None
-            self.box_end = None
-            if self.box_rect_id:
-                self.canvas.delete(self.box_rect_id)
-                self.box_rect_id = None
-            self._clear_polygon()
+        # Tab 0: 点击ROI, Tab 1: 框选ROI, Tab 2: Mask结果, Tab 3: 尺寸测量
+        if current_tab == 3:
+            # 测量 Tab — 进入测量模式，禁用ROI模式
+            self._enter_measurement_mode()
+        else:
+            # 非 测量 Tab — 退出测量模式，恢复ROI模式
+            self._exit_measurement_mode()
+            target_mode = "point" if current_tab == 0 else "box"
+            if self.prompt_mode.get() != target_mode:
+                # 同步ROI生成模式（设置 prompt_mode 会触发 radiobutton 更新，
+                # 但不会触发 _on_prompt_mode_change，需手动调用）
+                self.prompt_mode.set(target_mode)
+                # 清除交互状态（不再调用 _on_prompt_mode_change 避免递归 select）
+                self.is_drawing_box = False
+                self.box_start = None
+                self.box_end = None
+                if self.box_rect_id:
+                    self.canvas.delete(self.box_rect_id)
+                    self.box_rect_id = None
+                self._clear_polygon()
 
     def _on_shift_press(self, event):
         """Shift 键按下"""
@@ -1737,6 +1863,12 @@ class SAM3App:
             self.calib_start_canvas = (event.x, event.y)
             self.calib_is_dragging = True
             self._set_status("📏 校准: 拖拽画直线（按住 Shift 约束为水平/垂直/45°），释放鼠标完成")
+            return
+
+        # ── 测量模式：添加测量点 ──
+        measure_mode = self.measurement_mode.get()
+        if measure_mode in ("length", "angle", "angle_4pt", "perimeter", "fit_circle"):
+            self._add_measure_point(event.x, event.y)
             return
 
         mode = self.prompt_mode.get()
@@ -1837,6 +1969,41 @@ class SAM3App:
             self.calib_shift_end_canvas = (ex, ey) if self.shift_pressed else None
             return
 
+        # ── 测量模式：实时拖拽显示测量线段 ──
+        if self.measure_is_dragging and self.measure_points:
+            # 删除旧的临时线段和标注
+            if self.measure_drag_line_id:
+                self.canvas.delete(self.measure_drag_line_id)
+                self.measure_drag_line_id = None
+            if self.measure_drag_label_id:
+                self.canvas.delete(self.measure_drag_label_id)
+                self.measure_drag_label_id = None
+
+            last_pt = self.measure_points[-1]
+            sx, sy = last_pt["canvas_xy"]
+            ex, ey = event.x, event.y
+
+            # 画临时线段
+            self.measure_drag_line_id = self.canvas.create_line(
+                sx, sy, ex, ey,
+                fill="#FF4444", width=2, dash=(6, 3)
+            )
+
+            # 计算实时距离
+            img_end = self._canvas_to_image_coords(ex, ey)
+            dx = img_end[0] - last_pt["img_xy"][0]
+            dy = img_end[1] - last_pt["img_xy"][1]
+            pixel_dist = math.sqrt(dx * dx + dy * dy)
+            dist_text = self._format_calibrated_length(pixel_dist)
+            if dist_text:
+                mid_x, mid_y = (sx + ex) / 2, (sy + ey) / 2
+                self.measure_drag_label_id = self.canvas.create_text(
+                    mid_x, mid_y - 12,
+                    text=dist_text,
+                    fill="#FF4444", font=("", 10, "bold")
+                )
+            return
+
         if not self.is_drawing_box or self.prompt_mode.get() != "box":
             return
 
@@ -1868,8 +2035,84 @@ class SAM3App:
                 outline="#00FF00", width=2, dash=(6, 3),
             )
 
+    def _on_label_drag_start(self, event):
+        """右键检测鼠标是否在角度标注文字上，开始拖拽"""
+        # 只在非测量模式下允许拖拽标注
+        if self.measurement_mode.get() != "none":
+            return
+        # 查找鼠标下的文字元素
+        items = self.canvas.find_overlapping(event.x - 5, event.y - 5, event.x + 5, event.y + 5)
+        for item in items:
+            tags = self.canvas.gettags(item)
+            if "measurement" in tags:
+                try:
+                    item_type = self.canvas.type(item)
+                    if item_type == "text":
+                        # 找到对应的测量记录
+                        for m in self.measurements:
+                            if m["type"] in ("angle", "angle_4pt") and item in m["canvas_ids"]:
+                                self._label_drag_data = {
+                                    "measure_id": m["id"],
+                                    "label_id": item,
+                                    "start_x": event.x,
+                                    "start_y": event.y,
+                                }
+                                self.canvas.config(cursor="fleur")
+                                return
+                except Exception:
+                    pass
+
+    def _on_label_drag_motion(self, event):
+        """右键拖拽角度标注文字"""
+        if self._label_drag_data is None:
+            return
+        dx = event.x - self._label_drag_data["start_x"]
+        dy = event.y - self._label_drag_data["start_y"]
+        # 移动标注文字
+        self.canvas.move(self._label_drag_data["label_id"], dx, dy)
+        # 更新偏移量到测量记录
+        for m in self.measurements:
+            if m["id"] == self._label_drag_data["measure_id"]:
+                if m.get("label_offset") is None:
+                    m["label_offset"] = [0, 0]
+                m["label_offset"][0] += dx
+                m["label_offset"][1] += dy
+                break
+        self._label_drag_data["start_x"] = event.x
+        self._label_drag_data["start_y"] = event.y
+
+    def _on_label_drag_end(self, event):
+        """右键结束标注拖拽"""
+        if self._label_drag_data is not None:
+            self.canvas.config(cursor="")
+            self._label_drag_data = None
+
     def _on_canvas_release(self, event):
-        """鼠标释放（完成矩形/椭圆框选 → 自动添加 ROI，或完成校准直线）"""
+        """鼠标释放（完成矩形/椭圆框选 → 自动添加 ROI，或完成校准直线，或完成测量拖拽/控制点拖拽）"""
+        # ── 测量控制点拖拽结束 ──
+        if self.measure_point_dragging:
+            self.measure_point_dragging = False
+            self.measure_drag_measure_idx = None
+            self.measure_drag_point_idx = None
+            return  # 控制点拖拽结束
+
+        # ── 测量拖拽模式：完成长度测量拖拽 ──
+        if self.measure_is_dragging:
+            self.measure_is_dragging = False
+            # 清除临时线段和标注
+            if self.measure_drag_line_id:
+                self.canvas.delete(self.measure_drag_line_id)
+                self.measure_drag_line_id = None
+            if self.measure_drag_label_id:
+                self.canvas.delete(self.measure_drag_label_id)
+                self.measure_drag_label_id = None
+            # 添加终点
+            img_xy = self._canvas_to_image_coords(event.x, event.y)
+            self.measure_points.append({"canvas_xy": (event.x, event.y), "img_xy": img_xy})
+            # 完成测量
+            self._finish_current_measurement()
+            return
+
         # ── 校准模式：完成校准直线 ──
         if self.calib_is_dragging:
             self.calib_is_dragging = False
@@ -2016,6 +2259,11 @@ class SAM3App:
     def _on_canvas_double_click(self, event):
         """双击事件 — polygon 模式闭合多边形，其他模式 Fit 恢复窗口"""
         if self.image_np is None:
+            return
+        # ── 周长测量模式：双击闭合多边形 ──
+        mm = self.measurement_mode.get()
+        if mm == "perimeter" and self.measure_points:
+            self._on_canvas_double_click_measure(event)
             return
         mode = self.prompt_mode.get()
         if mode == "box" and self.box_shape_mode.get() == "polygon":
@@ -3723,6 +3971,1556 @@ class SAM3App:
         self._update_roi_tree()
 
     # ================================================================
+    #  测量模块
+    # ================================================================
+
+    def _on_measurement_mode_change(self):
+        """测量模式切换时触发（目前仅由测量 Tab 内的类型选择触发）"""
+        measure_mode = self.measurement_mode.get()
+        if measure_mode != "none":
+            # 进入测量模式 — 禁用 ROI 模式按钮并变暗
+            self._enter_measurement_mode()
+            # 切换到测量 Tab
+            self.notebook.select(3)  # Tab 3 = 尺寸测量
+            # 更新测量类型选择
+            self._update_measure_help()
+        else:
+            # 退出测量模式
+            self._exit_measurement_mode()
+
+    def _on_measurement_type_change(self):
+        """测量 Tab 内的测量类型 Radiobutton 切换时触发"""
+        # 清除当前未完成的测量点
+        self._clear_measure_temp()
+        measure_mode = self.measurement_mode.get()
+        if measure_mode != "none":
+            # 进入测量模式 — 禁用 ROI 模式按钮并变暗
+            self._enter_measurement_mode()
+            self._update_measure_help()
+            self._set_status(f"📐 测量模式: {self._get_measure_type_name(measure_mode)} — 请在图片上点击添加测量点")
+        else:
+            # 退出测量模式
+            self._exit_measurement_mode()
+
+    def _enter_measurement_mode(self):
+        """进入测量模式 — 禁用 ROI 模式 Tab，UI变暗"""
+        # 禁用 Tab 0 (点击ROI) 和 Tab 1 (框选ROI)，使其不可点击且变暗
+        try:
+            self.notebook.tab(0, state="disabled")
+            self.notebook.tab(1, state="disabled")
+        except Exception:
+            pass
+        self._set_status("📐 测量模式已激活 — ROI 点击/框选模式已禁用")
+
+    def _exit_measurement_mode(self):
+        """退出测量模式 — 恢复 ROI 模式 Tab"""
+        # 恢复 Tab 0 (点击ROI) 和 Tab 1 (框选ROI)，使其可点击
+        try:
+            self.notebook.tab(0, state="normal")
+            self.notebook.tab(1, state="normal")
+        except Exception:
+            pass
+        # 清除未完成的测量点
+        self._clear_measure_temp()
+        # 重置测量模式为 none
+        self.measurement_mode.set("none")
+
+    def _clear_measure_temp(self):
+        """清除当前未完成的测量临时元素"""
+        # 关闭弹窗（不调用 _hide_*_finish_btn 避免递归）
+        if hasattr(self, '_polyline_dialog') and self._polyline_dialog is not None:
+            try:
+                self._polyline_dialog.destroy()
+            except Exception:
+                pass
+            self._polyline_dialog = None
+        if hasattr(self, '_fit_circle_dialog') and self._fit_circle_dialog is not None:
+            try:
+                self._fit_circle_dialog.destroy()
+            except Exception:
+                pass
+            self._fit_circle_dialog = None
+        # 清除临时画布元素
+        for cid in self.measure_point_canvas_ids:
+            self.canvas.delete(cid)
+        self.measure_point_canvas_ids = []
+        for cid in self.measure_line_canvas_ids:
+            self.canvas.delete(cid)
+        self.measure_line_canvas_ids = []
+        for cid in self.measure_label_canvas_ids:
+            self.canvas.delete(cid)
+        self.measure_label_canvas_ids = []
+        # 清除拟合圆预览
+        for cid in self.fit_circle_preview_ids:
+            self.canvas.delete(cid)
+        self.fit_circle_preview_ids = []
+        self.fit_circle_preview_data = None
+        # 清空测量点
+        self.measure_points = []
+        self.measure_is_dragging = False
+        # 如果当前测量模式不是 none，重新进入测量模式
+        if self.measurement_mode.get() != "none":
+            self._enter_measurement_mode()
+            self._update_measure_help()
+
+    def _update_fit_circle_preview(self):
+        """更新拟合圆预览（3+个点时实时显示拟合圆）"""
+        # 清除之前的预览
+        for cid in self.fit_circle_preview_ids:
+            self.canvas.delete(cid)
+        self.fit_circle_preview_ids = []
+
+        if len(self.measure_points) < 3:
+            self.fit_circle_preview_data = None
+            return
+
+        import math as _m
+        # 使用原图坐标拟合圆心 (cx, cy) 和半径 r
+        n = len(self.measure_points)
+        sum_x = sum(pt["img_xy"][0] for pt in self.measure_points)
+        sum_y = sum(pt["img_xy"][1] for pt in self.measure_points)
+        sum_x2 = sum(pt["img_xy"][0]**2 for pt in self.measure_points)
+        sum_y2 = sum(pt["img_xy"][1]**2 for pt in self.measure_points)
+        sum_xy = sum(pt["img_xy"][0] * pt["img_xy"][1] for pt in self.measure_points)
+        sum_x3 = sum(pt["img_xy"][0]**3 for pt in self.measure_points)
+        sum_y3 = sum(pt["img_xy"][1]**3 for pt in self.measure_points)
+        sum_x2y = sum(pt["img_xy"][0]**2 * pt["img_xy"][1] for pt in self.measure_points)
+        sum_xy2 = sum(pt["img_xy"][0] * pt["img_xy"][1]**2 for pt in self.measure_points)
+
+        M = [[sum_x2, sum_xy, sum_x], [sum_xy, sum_y2, sum_y], [sum_x, sum_y, n]]
+        P = [-(sum_x3 + sum_xy2), -(sum_x2y + sum_y3), -(sum_x2 + sum_y2)]
+
+        try:
+            det_M = (M[0][0]*(M[1][1]*M[2][2]-M[1][2]*M[2][1])
+                    - M[0][1]*(M[1][0]*M[2][2]-M[1][2]*M[2][0])
+                    + M[0][2]*(M[1][0]*M[2][1]-M[1][1]*M[2][0]))
+            if abs(det_M) < 1e-10:
+                self.fit_circle_preview_data = None
+                return
+            def _det3(a):
+                return (a[0][0]*(a[1][1]*a[2][2]-a[1][2]*a[2][1])
+                       - a[0][1]*(a[1][0]*a[2][2]-a[1][2]*a[2][0])
+                       + a[0][2]*(a[1][0]*a[2][1]-a[1][1]*a[2][0]))
+            M1 = [[P[0], M[0][1], M[0][2]], [P[1], M[1][1], M[1][2]], [P[2], M[2][1], M[2][2]]]
+            M2 = [[M[0][0], P[0], M[0][2]], [M[1][0], P[1], M[1][2]], [M[2][0], P[2], M[2][2]]]
+            M3 = [[M[0][0], M[0][1], P[0]], [M[1][0], M[1][1], P[1]], [M[2][0], M[2][1], P[2]]]
+            A = _det3(M1) / det_M
+            B = _det3(M2) / det_M
+            C = _det3(M3) / det_M
+            img_cx = -A / 2
+            img_cy = -B / 2
+            img_r = _m.sqrt(img_cx*img_cx + img_cy*img_cy - C)
+            if img_r <= 0:
+                self.fit_circle_preview_data = None
+                return
+        except Exception:
+            self.fit_circle_preview_data = None
+            return
+
+        self.fit_circle_preview_data = {"img_cx": img_cx, "img_cy": img_cy, "img_r": img_r}
+
+        # 转换到画布坐标
+        canvas_cx, canvas_cy = self._image_to_canvas_coords(img_cx, img_cy)
+        edge_pt_canvas = self._image_to_canvas_coords(self.measure_points[0]["img_xy"][0], self.measure_points[0]["img_xy"][1])
+        canvas_r = _m.sqrt((edge_pt_canvas[0] - canvas_cx)**2 + (edge_pt_canvas[1] - canvas_cy)**2)
+
+        # 绘制预览圆（虚线，黄色）
+        circle_id = self.canvas.create_oval(
+            canvas_cx - canvas_r, canvas_cy - canvas_r,
+            canvas_cx + canvas_r, canvas_cy + canvas_r,
+            outline="#FFFF00", width=2, dash=(6, 3), tags="measurement"
+        )
+        # 绘制预览圆心标记（十字，黄色）
+        cross_size = 6
+        cross_h = self.canvas.create_line(
+            canvas_cx - cross_size, canvas_cy, canvas_cx + cross_size, canvas_cy,
+            fill="#FFFF00", width=2, tags="measurement"
+        )
+        cross_v = self.canvas.create_line(
+            canvas_cx, canvas_cy - cross_size, canvas_cx, canvas_cy + cross_size,
+            fill="#FFFF00", width=2, tags="measurement"
+        )
+        # 预览标注文字
+        pixel_diameter = 2 * img_r
+        pixel_circumference = 2 * _m.pi * img_r
+        preview_d = self._format_calibrated_length(pixel_diameter)
+        preview_c = self._format_calibrated_length(pixel_circumference)
+        preview_text = f"D={preview_d} C={preview_c}"
+        label_id = self.canvas.create_text(
+            canvas_cx, canvas_cy - canvas_r - 15,
+            text=preview_text,
+            fill="#FFFF00", font=("", 9), tags="measurement"
+        )
+
+        self.fit_circle_preview_ids = [circle_id, cross_h, cross_v, label_id]
+
+    def _show_fit_circle_finish_btn(self):
+        """显示拟合圆完成弹窗"""
+        # 如果弹窗已存在，不重复创建
+        if hasattr(self, '_fit_circle_dialog') and self._fit_circle_dialog is not None:
+            try:
+                self._fit_circle_dialog.deiconify()
+                self._fit_circle_dialog.lift()
+                return
+            except Exception:
+                self._fit_circle_dialog = None
+
+        # 创建弹窗
+        self._fit_circle_dialog = tk.Toplevel(self.root)
+        self._fit_circle_dialog.title("⭕ 拟合圆 — 完成")
+        self._fit_circle_dialog.geometry("280x120")
+        self._fit_circle_dialog.resizable(False, False)
+        self._fit_circle_dialog.transient(self.root)
+        # 不使用 grab_set，以免阻塞画布交互
+
+        # 弹窗内容
+        ttk.Label(self._fit_circle_dialog, text="已添加足够的点，可以完成拟合圆",
+                   font=("", 10)).pack(pady=(10, 5))
+        ttk.Label(self._fit_circle_dialog, text="点击 Fit 完成拟合，或继续在画布上添加更多点",
+                   font=("", 9), foreground="gray").pack(pady=(0, 10))
+
+        btn_frame = ttk.Frame(self._fit_circle_dialog)
+        btn_frame.pack(pady=5)
+        ttk.Button(btn_frame, text="✅ Fit 圆（完成拟合）", command=self._finish_fit_circle).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="❌ 取消", command=self._hide_fit_circle_finish_btn).pack(side=tk.LEFT, padx=5)
+
+    def _hide_fit_circle_finish_btn(self):
+        """关闭拟合圆完成弹窗并取消测量，清除所有临时元素重新开始"""
+        if hasattr(self, '_fit_circle_dialog') and self._fit_circle_dialog is not None:
+            try:
+                self._fit_circle_dialog.destroy()
+            except Exception:
+                pass
+            self._fit_circle_dialog = None
+        # 清除临时画布元素
+        for cid in self.measure_point_canvas_ids:
+            self.canvas.delete(cid)
+        self.measure_point_canvas_ids = []
+        for cid in self.measure_line_canvas_ids:
+            self.canvas.delete(cid)
+        self.measure_line_canvas_ids = []
+        for cid in self.measure_label_canvas_ids:
+            self.canvas.delete(cid)
+        self.measure_label_canvas_ids = []
+        for cid in self.fit_circle_preview_ids:
+            self.canvas.delete(cid)
+        self.fit_circle_preview_ids = []
+        self.fit_circle_preview_data = None
+        # 清空测量点列表
+        self.measure_points = []
+        self.measure_is_dragging = False
+        self.measure_drag_line_id = None
+        self.measure_drag_label_id = None
+        # 重新进入测量模式
+        mode = self.measurement_mode.get()
+        if mode != "none":
+            self._enter_measurement_mode()
+            self._update_measure_help()
+            self._set_status(f"📐 测量模式: {self._get_measure_type_name(mode)} — 已取消，重新开始")
+
+    def _show_polyline_finish_btn(self):
+        """显示多段线完成弹窗（与拟合圆逻辑一致）"""
+        if hasattr(self, '_polyline_dialog') and self._polyline_dialog is not None:
+            try:
+                self._polyline_dialog.deiconify()
+                self._polyline_dialog.lift()
+                return
+            except Exception:
+                self._polyline_dialog = None
+
+        self._polyline_dialog = tk.Toplevel(self.root)
+        self._polyline_dialog.title("📏 多段线 — 完成")
+        self._polyline_dialog.geometry("280x120")
+        self._polyline_dialog.resizable(False, False)
+        self._polyline_dialog.transient(self.root)
+
+        ttk.Label(self._polyline_dialog, text="已添加 3+ 个点，是否完成多段线测量？",
+                   font=("", 10)).pack(pady=(10, 5))
+        ttk.Label(self._polyline_dialog, text="点击 Fit 完成测量，或继续在画布上添加更多点",
+                   font=("", 9), foreground="gray").pack(pady=(0, 10))
+
+        btn_frame = ttk.Frame(self._polyline_dialog)
+        btn_frame.pack(pady=5)
+        ttk.Button(btn_frame, text="✅ Fit 多段线", command=self._finish_polyline).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="❌ 取消", command=self._hide_polyline_finish_btn).pack(side=tk.LEFT, padx=5)
+
+    def _hide_polyline_finish_btn(self):
+        """隐藏多段线完成弹窗并取消测量，清除所有临时元素重新开始"""
+        if hasattr(self, '_polyline_dialog') and self._polyline_dialog is not None:
+            try:
+                self._polyline_dialog.destroy()
+            except Exception:
+                pass
+            self._polyline_dialog = None
+        # 清除临时画布元素
+        for cid in self.measure_point_canvas_ids:
+            self.canvas.delete(cid)
+        self.measure_point_canvas_ids = []
+        for cid in self.measure_line_canvas_ids:
+            self.canvas.delete(cid)
+        self.measure_line_canvas_ids = []
+        for cid in self.measure_label_canvas_ids:
+            self.canvas.delete(cid)
+        self.measure_label_canvas_ids = []
+        # 清空测量点列表
+        self.measure_points = []
+        self.measure_is_dragging = False
+        self.measure_drag_line_id = None
+        self.measure_drag_label_id = None
+        # 重新进入测量模式
+        mode = self.measurement_mode.get()
+        if mode != "none":
+            self._enter_measurement_mode()
+            self._update_measure_help()
+            self._set_status(f"📐 测量模式: {self._get_measure_type_name(mode)} — 已取消，重新开始")
+
+    def _finish_polyline(self):
+        """完成多段线测量"""
+        if len(self.measure_points) < 2:
+            self._set_status("📐 多段线: 至少需要2个点才能完成")
+            return
+        # 关闭弹窗（只销毁弹窗，不清空 measure_points）
+        if hasattr(self, '_polyline_dialog') and self._polyline_dialog is not None:
+            try:
+                self._polyline_dialog.destroy()
+            except Exception:
+                pass
+            self._polyline_dialog = None
+        # 完成测量（measure_points 保留给 _finish_current_measurement 使用）
+        self._finish_current_measurement()
+        if self.measure_drag_line_id:
+            self.canvas.delete(self.measure_drag_line_id)
+            self.measure_drag_line_id = None
+        if self.measure_drag_label_id:
+            self.canvas.delete(self.measure_drag_label_id)
+            self.measure_drag_label_id = None
+        self.measure_points = []
+        self.measure_is_dragging = False
+        self._set_status("📐 多段线测量完成")
+
+    def _finish_fit_circle(self):
+        """点击 Fit 按钮完成拟合圆测量"""
+        if len(self.measure_points) < 3:
+            self._set_status("📐 拟合圆: 至少需要3个点才能完成")
+            return
+        # 清除预览元素（将由正式标注替代）
+        for cid in self.fit_circle_preview_ids:
+            self.canvas.delete(cid)
+        self.fit_circle_preview_ids = []
+        self.fit_circle_preview_data = None
+        # 关闭弹窗（只销毁弹窗，不清空 measure_points）
+        if hasattr(self, '_fit_circle_dialog') and self._fit_circle_dialog is not None:
+            try:
+                self._fit_circle_dialog.destroy()
+            except Exception:
+                pass
+            self._fit_circle_dialog = None
+        # 完成测量（measure_points 保留给 _finish_current_measurement 使用）
+        self._finish_current_measurement()
+        if self.measure_drag_line_id:
+            self.canvas.delete(self.measure_drag_line_id)
+            self.measure_drag_line_id = None
+        if self.measure_drag_label_id:
+            self.canvas.delete(self.measure_drag_label_id)
+            self.measure_drag_label_id = None
+        self.measure_points = []
+        self.measure_is_dragging = False
+        self._set_status("📐 拟合圆测量完成")
+
+    def _on_length_unit_change(self, event=None):
+        """长度单位切换时重新计算所有测量结果并重绘"""
+        # 重新计算所有涉及长度的测量值
+        for m in self.measurements:
+            if m["type"] in ("length", "perimeter", "fit_circle"):
+                value, value_unit, type_name = self._compute_measurement(m["type"], m["points"])
+                m["value"] = value
+                m["value_unit"] = value_unit
+                m["type_name"] = type_name
+        self._redraw_all_measurements()
+        self._update_measure_tree()
+        unit = self.length_unit_var.get()
+        self._set_status(f"📐 长度单位已切换为: {unit}")
+
+    def _on_angle_unit_change(self, event=None):
+        """角度单位切换时重新计算所有角度测量值并重绘"""
+        # 重新计算所有涉及角度的测量值
+        for m in self.measurements:
+            if m["type"] in ("angle", "angle_4pt"):
+                value, value_unit, type_name = self._compute_measurement(m["type"], m["points"])
+                m["value"] = value
+                m["value_unit"] = value_unit
+                m["type_name"] = type_name
+        self._redraw_all_measurements()
+        self._update_measure_tree()
+        unit = self.angle_unit_var.get()
+        self._set_status(f"📐 角度单位已切换为: {unit}")
+
+    def _update_measure_help(self):
+        """根据测量类型更新操作说明"""
+        mode = self.measurement_mode.get()
+        help_texts = {
+            "length": "• 点击第1个点开始，拖拽到第2个点释放\n• 或依次点击2个点完成长度测量\n• 拖拽时实时显示距离值",
+            "angle": "• 依次点击3个点：第1个边缘点、顶点、第2个边缘点\n• 顶点（第2个点）为角的交点\n• 测量两条边的夹角，范围: 0° ~ 180°\n• 完成后可拖拽控制点调整",
+            "angle_4pt": "• 依次点击4个点：P1、P2拟合直线1，P3、P4拟合直线2\n• 计算两直线的夹角，范围: 0° ~ 90°\n• 完成后可拖拽控制点调整",
+            "perimeter": "• 依次点击多个点\n• 3点后弹出完成按钮\n• 点击 ✅ Fit 多段线 完成测量\n• 测量多段线总长度（至少2个点）",
+            "fit_circle": "• 依次点击3个或更多点\n• 3点后实时预览拟合圆\n• 可继续添加点优化拟合\n• 点击 Fit 按钮完成拟合",
+            "none": "请选择测量类型后在图片上点击添加测量点",
+        }
+        self.measure_help_label.config(text=help_texts.get(mode, help_texts["none"]))
+
+    def _get_measure_type_name(self, mode):
+        """获取测量类型的中文名称"""
+        names = {
+            "length": "长度",
+            "angle": "角度(3点)",
+            "angle_4pt": "角度(4点)",
+            "perimeter": "多段线",
+            "fit_circle": "拟合圆",
+        }
+        return names.get(mode, mode)
+
+    def _add_measure_point(self, canvas_x, canvas_y):
+        """添加一个测量点"""
+        mode = self.measurement_mode.get()
+        if mode == "none":
+            return
+
+        img_xy = self._canvas_to_image_coords(canvas_x, canvas_y)
+        pt_data = {"canvas_xy": (canvas_x, canvas_y), "img_xy": img_xy}
+        self.measure_points.append(pt_data)
+
+        # 在画布上绘制测量点标记（长度模式不绘制圆点，只用tick须线标注）
+        if mode != "length":
+            r = 5
+            pt_id = self.canvas.create_oval(
+                canvas_x - r, canvas_y - r, canvas_x + r, canvas_y + r,
+                fill="#FF4444", outline="white", width=1, tags="measurement"
+            )
+            self.measure_point_canvas_ids.append(pt_id)
+        # 长度模式：不绘制圆点也不存None，tick须线将在完成测量时绘制
+
+        # 根据测量类型处理
+        if mode == "length":
+            if len(self.measure_points) == 1:
+                # 第1个点 — 开始拖拽
+                self.measure_is_dragging = True
+                self._set_status("📐 长度测量: 拖拽到目标位置释放鼠标，或点击第2个点")
+            elif len(self.measure_points) == 2:
+                # 第2个点 — 完成长度测量（非拖拽方式，即依次点击2个点）
+                if not self.measure_is_dragging:
+                    self._finish_current_measurement()
+
+        elif mode == "angle":
+            if len(self.measure_points) == 3:
+                # 3个点 — 完成角度测量
+                self._finish_current_measurement()
+            else:
+                self._set_status(f"📐 角度测量: 已添加 {len(self.measure_points)} 个点，还需 {3 - len(self.measure_points)} 个点")
+
+        elif mode == "angle_4pt":
+            if len(self.measure_points) == 4:
+                # 4个点 — 完成4点角度测量
+                self._finish_current_measurement()
+            else:
+                self._set_status(f"📐 4点角度测量: 已添加 {len(self.measure_points)} 个点，还需 {4 - len(self.measure_points)} 个点")
+
+        elif mode == "perimeter":
+            # 多段线 — 持续添加点，3点后弹出Fit按钮
+            # 绘制连接线段（从上一个点到当前点）
+            if len(self.measure_points) >= 2:
+                prev_pt = self.measure_points[-2]
+                line_id = self.canvas.create_line(
+                    prev_pt["canvas_xy"][0], prev_pt["canvas_xy"][1],
+                    canvas_x, canvas_y,
+                    fill="#FF4444", width=2, tags="measurement"
+                )
+                self.measure_line_canvas_ids.append(line_id)
+            self._set_status(f"📐 多段线测量: 已添加 {len(self.measure_points)} 个点")
+            # 3点后弹出Fit按钮（与拟合圆逻辑一致）
+            if len(self.measure_points) >= 3:
+                self._show_polyline_finish_btn()
+
+        elif mode == "fit_circle":
+            # 拟合圆 — 3点后才开始预览，1-2点时不显示任何圆
+            if len(self.measure_points) >= 3:
+                self._update_fit_circle_preview()
+                self._show_fit_circle_finish_btn()
+                self._set_status(f"📐 拟合圆: 已添加 {len(self.measure_points)} 个点，点击更多点或按 Fit 完成")
+            else:
+                self._set_status(f"📐 拟合圆: 已添加 {len(self.measure_points)} 个点，继续点击添加更多点")
+
+    def _on_canvas_double_click_measure(self, event):
+        """双击事件 — 多段线模式不再通过双击闭合，通过Fit按钮完成"""
+        # 多段线通过 Fit 按钮完成，不再支持双击闭合
+        pass
+
+    def _finish_current_measurement(self):
+        """完成当前测量 — 计算结果并保存"""
+        mode = self.measurement_mode.get()
+        if not self.measure_points:
+            return
+
+        self.measure_is_dragging = False
+        self.measure_counter += 1
+
+        # 计算测量值
+        value, value_unit, type_name = self._compute_measurement(mode, self.measure_points)
+
+        # 拟合圆模式：删除临时连线（虚线），只保留点标记
+        if mode == "fit_circle":
+            for lid in self.measure_line_canvas_ids:
+                self.canvas.delete(lid)
+            self.measure_line_canvas_ids = []
+
+        # 清除临时画布元素（将转为正式测量记录的画布元素）
+        temp_point_ids = [cid for cid in self.measure_point_canvas_ids if cid is not None]
+        temp_line_ids = [cid for cid in self.measure_line_canvas_ids if cid is not None]
+        temp_label_ids = [cid for cid in self.measure_label_canvas_ids if cid is not None]
+        self.measure_point_canvas_ids = []
+        self.measure_line_canvas_ids = []
+        self.measure_label_canvas_ids = []
+
+        # 保存测量记录（先保存，再绘制标注，因为标注绘制会 extend canvas_ids）
+        measure_data = {
+            "id": self.measure_counter,
+            "name": f"Measure_{self.measure_counter}",
+            "type": mode,
+            "type_name": type_name,
+            "points": [{"img_xy": pt["img_xy"]} for pt in self.measure_points],  # 只保存原图坐标
+            "value": value,
+            "value_unit": value_unit,
+            "label_offset": None,  # 标注位置偏移（用于自由拖拽），None 表示使用默认位置
+            "canvas_ids": temp_point_ids + temp_line_ids + temp_label_ids,
+            "visible": True,
+        }
+        self.measurements.append(measure_data)
+
+        # 先更新 Treeview（确保测量结果及时出现在右边列表）
+        # 即使后续标注绘制出错，Treeview 也能正确显示
+        self._update_measure_tree()
+
+        # 创建正式的测量标注（在画布上显示测量值）
+        # 注意：此方法会通过 self.measurements[-1]["canvas_ids"].extend() 添加标注元素
+        try:
+            self._draw_measurement_annotation(mode, self.measure_points, value, value_unit)
+        except Exception as e:
+            self._log(f"⚠️ 绘制测量标注失败: {e}")
+
+        # 清除临时状态
+        self.measure_points = []
+
+        self._set_status(f"📐 测量完成: {type_name} = {value} {value_unit}")
+
+    def _compute_measurement(self, mode, points):
+        """计算测量值"""
+        import math
+
+        if mode == "length" and len(points) >= 2:
+            p1 = points[0]["img_xy"]
+            p2 = points[1]["img_xy"]
+            dx = p2[0] - p1[0]
+            dy = p2[1] - p1[1]
+            pixel_dist = math.sqrt(dx * dx + dy * dy)
+            # 使用测量模块的长度单位
+            measurement_unit = self.length_unit_var.get() if hasattr(self, 'length_unit_var') else "px"
+            if measurement_unit == "px":
+                value = f"{pixel_dist:.1f}"
+                unit = "px"
+            else:
+                calibrated = self._format_calibrated_length(pixel_dist, measurement_unit=measurement_unit)
+                if calibrated:
+                    parts = calibrated.split()
+                    value = parts[0]
+                    unit = parts[1] if len(parts) > 1 else "px"
+                else:
+                    value = f"{pixel_dist:.1f}"
+                    unit = "px"
+            return value, unit, "长度"
+
+        elif mode == "angle" and len(points) >= 3:
+            # P1-P2-P3 的夹角，P2 为角点（顶点）
+            p1 = points[0]["img_xy"]
+            p2 = points[1]["img_xy"]  # 顶点
+            p3 = points[2]["img_xy"]
+            # 向量 P2->P1 和 P2->P3
+            v1 = (p1[0] - p2[0], p1[1] - p2[1])
+            v2 = (p3[0] - p2[0], p3[1] - p2[1])
+            # 计算夹角
+            dot = v1[0] * v2[0] + v1[1] * v2[1]
+            mag1 = math.sqrt(v1[0]**2 + v1[1]**2)
+            mag2 = math.sqrt(v2[0]**2 + v2[1]**2)
+            if mag1 == 0 or mag2 == 0:
+                return "N/A", "°", "角度(3点)"
+            cos_angle = dot / (mag1 * mag2)
+            cos_angle = max(-1, min(1, cos_angle))
+            angle_deg = math.degrees(math.acos(cos_angle))
+            # 角度单位转换
+            if hasattr(self, 'angle_unit_var') and self.angle_unit_var and self.angle_unit_var.get() == "rad":
+                return f"{math.acos(cos_angle):.4f}", "rad", "角度(3点)"
+            return f"{angle_deg:.2f}", "°", "角度(3点)"
+
+        elif mode == "angle_4pt" and len(points) >= 4:
+            # 4点角度：P1,P2 拟合直线1，P3,P4 拟合直线2，计算两直线夹角
+            p1 = points[0]["img_xy"]
+            p2 = points[1]["img_xy"]
+            p3 = points[2]["img_xy"]
+            p4 = points[3]["img_xy"]
+            # 直线1方向向量: P2 - P1
+            v1 = (p2[0] - p1[0], p2[1] - p1[1])
+            # 直线2方向向量: P4 - P3
+            v2 = (p4[0] - p3[0], p4[1] - p3[1])
+            mag1 = math.sqrt(v1[0]**2 + v1[1]**2)
+            mag2 = math.sqrt(v2[0]**2 + v2[1]**2)
+            if mag1 == 0 or mag2 == 0:
+                return "N/A", "°", "角度(4点)"
+            dot = v1[0] * v2[0] + v1[1] * v2[1]
+            cos_angle = dot / (mag1 * mag2)
+            cos_angle = max(-1, min(1, cos_angle))
+            angle_deg = math.degrees(math.acos(cos_angle))
+            # 角度单位转换
+            if hasattr(self, 'angle_unit_var') and self.angle_unit_var and self.angle_unit_var.get() == "rad":
+                return f"{math.acos(cos_angle):.4f}", "rad", "角度(4点)"
+            return f"{angle_deg:.2f}", "°", "角度(4点)"
+
+        elif mode == "perimeter" and len(points) >= 2:
+            # 多段线总长度（不闭合）
+            total_dist = 0
+            for i in range(len(points) - 1):
+                p1 = points[i]["img_xy"]
+                p2 = points[i + 1]["img_xy"]
+                dx = p2[0] - p1[0]
+                dy = p2[1] - p1[1]
+                total_dist += math.sqrt(dx * dx + dy * dy)
+            # 使用测量模块的长度单位
+            measurement_unit = self.length_unit_var.get() if hasattr(self, 'length_unit_var') else "px"
+            if measurement_unit == "px":
+                value = f"{total_dist:.1f}"
+                unit = "px"
+            else:
+                calibrated = self._format_calibrated_length(total_dist, measurement_unit=measurement_unit)
+                if calibrated:
+                    parts = calibrated.split()
+                    value = parts[0]
+                    unit = parts[1] if len(parts) > 1 else "px"
+                else:
+                    value = f"{total_dist:.1f}"
+                    unit = "px"
+            return value, unit, "多段线"
+
+        elif mode == "fit_circle" and len(points) >= 3:
+            # 拟合圆 — 使用最小二乘法拟合圆心 (cx, cy) 和半径 r
+            # 方程: (x-cx)^2 + (y-cy)^2 = r^2
+            # 展开: x^2 + y^2 - 2*cx*x - 2*cy*y + cx^2 + cy^2 - r^2 = 0
+            # 令 A = -2*cx, B = -2*cy, C = cx^2 + cy^2 - r^2
+            # 则: x^2 + y^2 + A*x + B*y + C = 0
+            # 用最小二乘法解 A, B, C
+            n = len(points)
+            sum_x = sum(pt["img_xy"][0] for pt in points)
+            sum_y = sum(pt["img_xy"][1] for pt in points)
+            sum_x2 = sum(pt["img_xy"][0]**2 for pt in points)
+            sum_y2 = sum(pt["img_xy"][1]**2 for pt in points)
+            sum_xy = sum(pt["img_xy"][0] * pt["img_xy"][1] for pt in points)
+            sum_x3 = sum(pt["img_xy"][0]**3 for pt in points)
+            sum_y3 = sum(pt["img_xy"][1]**3 for pt in points)
+            sum_x2y = sum(pt["img_xy"][0]**2 * pt["img_xy"][1] for pt in points)
+            sum_xy2 = sum(pt["img_xy"][0] * pt["img_xy"][1]**2 for pt in points)
+            # 矩阵形式: M * [A, B, C]^T = P
+            # M = [[sum_x2, sum_xy, sum_x], [sum_xy, sum_y2, sum_y], [sum_x, sum_y, n]]
+            # P = [-(sum_x3 + sum_xy2), -(sum_x2y + sum_y3), -(sum_x2 + sum_y2)]
+            M = [
+                [sum_x2, sum_xy, sum_x],
+                [sum_xy, sum_y2, sum_y],
+                [sum_x, sum_y, n],
+            ]
+            P = [-(sum_x3 + sum_xy2), -(sum_x2y + sum_y3), -(sum_x2 + sum_y2)]
+            # 解 3x3 线性方程组
+            try:
+                det_M = (M[0][0] * (M[1][1]*M[2][2] - M[1][2]*M[2][1])
+                        - M[0][1] * (M[1][0]*M[2][2] - M[1][2]*M[2][0])
+                        + M[0][2] * (M[1][0]*M[2][1] - M[1][1]*M[2][0]))
+                if abs(det_M) < 1e-10:
+                    return "N/A", "", "拟合圆"
+                # Cramer's rule
+                def _det3(a):
+                    return (a[0][0]*(a[1][1]*a[2][2]-a[1][2]*a[2][1])
+                           - a[0][1]*(a[1][0]*a[2][2]-a[1][2]*a[2][0])
+                           + a[0][2]*(a[1][0]*a[2][1]-a[1][1]*a[2][0]))
+                M1 = [P, [M[1][0], M[1][1], M[1][2]], [M[2][0], M[2][1], M[2][2]]]
+                M2 = [[M[0][0], M[0][1], M[0][2]], P, [M[2][0], M[2][1], M[2][2]]]
+                M3 = [[M[0][0], M[0][1], M[0][2]], [M[1][0], M[1][1], M[1][2]], P]
+                # 重新排列列
+                M1 = [[P[0], M[0][1], M[0][2]], [P[1], M[1][1], M[1][2]], [P[2], M[2][1], M[2][2]]]
+                M2 = [[M[0][0], P[0], M[0][2]], [M[1][0], P[1], M[1][2]], [M[2][0], P[2], M[2][2]]]
+                M3 = [[M[0][0], M[0][1], P[0]], [M[1][0], M[1][1], P[1]], [M[2][0], M[2][1], P[2]]]
+                A = _det3(M1) / det_M
+                B = _det3(M2) / det_M
+                C = _det3(M3) / det_M
+                cx = -A / 2
+                cy = -B / 2
+                r = math.sqrt(cx*cx + cy*cy - C)
+                if r <= 0:
+                    return "N/A", "", "拟合圆"
+            except Exception:
+                return "N/A", "", "拟合圆"
+            # 保存拟合圆数据到测量记录
+            pixel_diameter = 2 * r
+            pixel_circumference = 2 * math.pi * r
+            # 使用测量模块的长度单位
+            measurement_unit = self.length_unit_var.get() if hasattr(self, 'length_unit_var') else "px"
+            calibrated_diameter = self._format_calibrated_length(pixel_diameter, measurement_unit=measurement_unit)
+            calibrated_circumference = self._format_calibrated_length(pixel_circumference, measurement_unit=measurement_unit)
+            # 返回直径和周长（显示两者）
+            if calibrated_diameter:
+                parts_d = calibrated_diameter.split()
+                value_d = parts_d[0]
+                unit_d = parts_d[1] if len(parts_d) > 1 else "px"
+            else:
+                value_d = f"{pixel_diameter:.1f}"
+                unit_d = "px"
+            if calibrated_circumference:
+                parts_c = calibrated_circumference.split()
+                value_c = parts_c[0]
+                unit_c = parts_c[1] if len(parts_c) > 1 else "px"
+            else:
+                value_c = f"{pixel_circumference:.1f}"
+                unit_c = "px"
+            # 值格式: "直径 / 周长"
+            value = f"D={value_d} C={value_c}"
+            unit = f"{unit_d}"
+            # 保存拟合圆心和半径信息，用于绘制
+            return value, unit, "拟合圆"
+
+        return "N/A", "", mode
+
+    def _format_calibrated_length(self, pixel_dist, measurement_unit=None):
+        """格式化校准后的长度显示
+
+        Args:
+            pixel_dist: 像素距离
+            measurement_unit: 测量模块的目标单位（优先使用），None 时使用 ROI 的 display_unit
+
+        Returns:
+            校准长度文本（如 "3.52 mm"），无校准时返回像素距离文本（如 "3.52 px"）
+        """
+        # 如果测量单位是 px，直接返回像素值（不做校准转换）
+        if measurement_unit == "px":
+            return f"{pixel_dist:.1f} px"
+
+        # 如果没有校准数据，非 px 单位无法换算，返回 px
+        if self.calibration_data is None:
+            return f"{pixel_dist:.1f} px"
+
+        scale = self.calibration_data["scale"]  # pixels per calibration unit
+        calib_unit = self.calibration_data["unit"]
+        # 使用测量模块指定的单位，None 时回退到 ROI 的 display_unit
+        if measurement_unit:
+            display_unit = measurement_unit
+        else:
+            display_unit = self.display_unit.get()
+
+        # 长度 = pixel_dist / scale calibration_unit
+        real_length_calib = pixel_dist / scale
+
+        # 单位换算
+        unit_to_mm = {"mm": 1.0, "um": 0.001, "μm": 0.001, "cm": 10.0, "in": 25.4}
+        calib_mm_factor = unit_to_mm.get(calib_unit, 1.0)
+        display_mm_factor = unit_to_mm.get(display_unit, 1.0)
+        linear_ratio = calib_mm_factor / display_mm_factor
+
+        real_length_display = real_length_calib * linear_ratio
+
+        # 单位显示
+        unit_display = {"mm": "mm", "um": "μm", "μm": "μm", "cm": "cm", "in": "in"}
+        u = unit_display.get(display_unit, display_unit)
+
+        if real_length_display >= 100:
+            return f"{real_length_display:.1f} {u}"
+        elif real_length_display >= 1:
+            return f"{real_length_display:.2f} {u}"
+        elif real_length_display >= 0.01:
+            return f"{real_length_display:.4f} {u}"
+        else:
+            return f"{real_length_display:.6f} {u}"
+
+    def _draw_measurement_annotation(self, mode, points, value, value_unit):
+        """在画布上绘制测量标注（线段、角度弧、标注文字等）"""
+        # 首先删除临时点标记，用更正式的样式重绘
+        # 注意：临时点标记已在 _finish_current_measurement 中保存到 canvas_ids
+
+        if mode == "length" and len(points) >= 2:
+            # 绘制测量线段
+            p1_canvas = self._image_to_canvas_coords(points[0]["img_xy"][0], points[0]["img_xy"][1])
+            p2_canvas = self._image_to_canvas_coords(points[1]["img_xy"][0], points[1]["img_xy"][1])
+            line_id = self.canvas.create_line(
+                p1_canvas[0], p1_canvas[1], p2_canvas[0], p2_canvas[1],
+                fill="#FF4444", width=2, tags="measurement"
+            )
+            # 绘制须线（tick marks）— 尺寸线两端垂直短线
+            import math as _m
+            dx = p2_canvas[0] - p1_canvas[0]
+            dy = p2_canvas[1] - p1_canvas[1]
+            line_len = _m.sqrt(dx*dx + dy*dy)
+            if line_len > 0:
+                # 垂直方向单位向量
+                nx = -dy / line_len
+                ny = dx / line_len
+                tick_len = 8  # 须线长度
+                # P1端须线
+                tick1_id = self.canvas.create_line(
+                    p1_canvas[0] + nx*tick_len, p1_canvas[1] + ny*tick_len,
+                    p1_canvas[0] - nx*tick_len, p1_canvas[1] - ny*tick_len,
+                    fill="#FF4444", width=2, tags="measurement"
+                )
+                # P2端须线
+                tick2_id = self.canvas.create_line(
+                    p2_canvas[0] + nx*tick_len, p2_canvas[1] + ny*tick_len,
+                    p2_canvas[0] - nx*tick_len, p2_canvas[1] - ny*tick_len,
+                    fill="#FF4444", width=2, tags="measurement"
+                )
+            else:
+                tick1_id = None
+                tick2_id = None
+            # 绘制标注文字（中点上方）
+            mid_x = (p1_canvas[0] + p2_canvas[0]) / 2
+            mid_y = (p1_canvas[1] + p2_canvas[1]) / 2
+            label_id = self.canvas.create_text(
+                mid_x, mid_y - 12,
+                text=f"{value} {value_unit}",
+                fill="#FF4444", font=("", 10, "bold"), tags="measurement"
+            )
+            # 保存到最近一条测量记录的 canvas_ids
+            if self.measurements:
+                ids = [line_id]
+                if tick1_id: ids.append(tick1_id)
+                if tick2_id: ids.append(tick2_id)
+                ids.append(label_id)
+                self.measurements[-1]["canvas_ids"].extend(ids)
+
+        elif mode == "angle" and len(points) >= 3:
+            p1_canvas = self._image_to_canvas_coords(points[0]["img_xy"][0], points[0]["img_xy"][1])      # 边缘点1
+            p2_canvas = self._image_to_canvas_coords(points[1]["img_xy"][0], points[1]["img_xy"][1])       # 顶点
+            p3_canvas = self._image_to_canvas_coords(points[2]["img_xy"][0], points[2]["img_xy"][1])       # 边缘点2
+            # 绘制两条射线
+            line1_id = self.canvas.create_line(
+                p2_canvas[0], p2_canvas[1], p1_canvas[0], p1_canvas[1],
+                fill="#FF4444", width=2, tags="measurement"
+            )
+            line2_id = self.canvas.create_line(
+                p2_canvas[0], p2_canvas[1], p3_canvas[0], p3_canvas[1],
+                fill="#FF4444", width=2, tags="measurement"
+            )
+            # 绘制角度弧线
+            import math
+            v1 = (p1_canvas[0] - p2_canvas[0], p1_canvas[1] - p2_canvas[1])
+            v2 = (p3_canvas[0] - p2_canvas[0], p3_canvas[1] - p2_canvas[1])
+            angle1 = math.atan2(v1[1], v1[0])
+            angle2 = math.atan2(v2[1], v2[0])
+            # 绘制弧线
+            arc_r = 25  # 弧线半径
+            # 使用 create_arc 绘制角度弧
+            # 修复弧线 extent 计算：使用标准化角度差确保弧线在较小角度内绘制
+            angle_diff = angle2 - angle1
+            angle_diff_norm = angle_diff % (2 * math.pi)
+            if angle_diff_norm > math.pi:
+                angle_diff_norm -= 2 * math.pi
+            arc_extent = math.degrees(angle_diff_norm)
+            arc_id = self.canvas.create_arc(
+                p2_canvas[0] - arc_r, p2_canvas[1] - arc_r,
+                p2_canvas[0] + arc_r, p2_canvas[1] + arc_r,
+                start=-math.degrees(angle1), extent=-arc_extent,
+                outline="#FF4444", width=2, style=tk.ARC, tags="measurement"
+            )
+            # 标注文字放在角度内部（沿角平分线方向，距离顶点一定距离）
+            # 始终指向两条射线之间较小角度的内部
+            # 角平分线方向：沿较小角度的中心
+            # 注意：atan2角度在画布坐标系中（y向下）是正确的方向，
+            # 但create_arc使用tkinter角度系统（逆时针），需要翻转
+            # 标注位置使用atan2的cos/sin是正确的（画布坐标系中y向下）
+            bisector_angle = angle1 + angle_diff_norm / 2
+            label_dist = arc_r * 0.7  # 标注文字在弧线内部
+            default_label_x = p2_canvas[0] + label_dist * math.cos(bisector_angle)
+            default_label_y = p2_canvas[1] + label_dist * math.sin(bisector_angle)
+            # 如果有 label_offset（用户拖拽过的偏移量），使用偏移位置
+            if self.measurements and self.measurements[-1].get("label_offset"):
+                offset = self.measurements[-1]["label_offset"]
+                label_x = default_label_x + offset[0]
+                label_y = default_label_y + offset[1]
+            else:
+                label_x = default_label_x
+                label_y = default_label_y
+            label_id = self.canvas.create_text(
+                label_x, label_y,
+                text=f"{value}{value_unit}",
+                fill="#FF4444", font=("", 10, "bold"), tags="measurement"
+            )
+            # 角点用不同颜色标记
+            r = 5
+            vertex_id = self.canvas.create_oval(
+                p2_canvas[0] - r, p2_canvas[1] - r, p2_canvas[0] + r, p2_canvas[1] + r,
+                fill="#FF6600", outline="white", width=1, tags="measurement"
+            )
+            # 确保所有绘制元素都添加到 canvas_ids（包括线、弧、标注、顶点）
+            all_ids = [line1_id, line2_id, arc_id, label_id, vertex_id]
+            all_ids = [cid for cid in all_ids if cid is not None]
+            if self.measurements:
+                self.measurements[-1]["canvas_ids"].extend(all_ids)
+
+        elif mode == "angle_4pt" and len(points) >= 4:
+            # 4点角度：P1,P2 拟合直线1，P3,P4 拟合直线2
+            # 使用 _image_to_canvas_coords 从 img_xy 转换（与 _redraw_all_measurements 一致）
+            p1_canvas = self._image_to_canvas_coords(points[0]["img_xy"][0], points[0]["img_xy"][1])  # 直线1点1
+            p2_canvas = self._image_to_canvas_coords(points[1]["img_xy"][0], points[1]["img_xy"][1])  # 直线1点2
+            p3_canvas = self._image_to_canvas_coords(points[2]["img_xy"][0], points[2]["img_xy"][1])  # 直线2点1
+            p4_canvas = self._image_to_canvas_coords(points[3]["img_xy"][0], points[3]["img_xy"][1])  # 直线2点2
+            # 绘制两条拟合直线（延长线，各方向延伸50像素）
+            import math
+            # 直线1方向
+            dx1 = p2_canvas[0] - p1_canvas[0]
+            dy1 = p2_canvas[1] - p1_canvas[1]
+            len1 = math.sqrt(dx1*dx1 + dy1*dy1)
+            if len1 > 0:
+                ext1 = 50
+                ux1, uy1 = dx1/len1, dy1/len1
+                line1_id = self.canvas.create_line(
+                    p1_canvas[0] - ux1*ext1, p1_canvas[1] - uy1*ext1,
+                    p2_canvas[0] + ux1*ext1, p2_canvas[1] + uy1*ext1,
+                    fill="#FF4444", width=2, tags="measurement"
+                )
+            else:
+                line1_id = self.canvas.create_line(
+                    p1_canvas[0], p1_canvas[1], p2_canvas[0], p2_canvas[1],
+                    fill="#FF4444", width=2, tags="measurement"
+                )
+            # 直线2方向
+            dx2 = p4_canvas[0] - p3_canvas[0]
+            dy2 = p4_canvas[1] - p3_canvas[1]
+            len2 = math.sqrt(dx2*dx2 + dy2*dy2)
+            if len2 > 0:
+                ext2 = 50
+                ux2, uy2 = dx2/len2, dy2/len2
+                line2_id = self.canvas.create_line(
+                    p3_canvas[0] - ux2*ext2, p3_canvas[1] - uy2*ext2,
+                    p4_canvas[0] + ux2*ext2, p4_canvas[1] + uy2*ext2,
+                    fill="#FF4444", width=2, tags="measurement"
+                )
+            else:
+                line2_id = self.canvas.create_line(
+                    p3_canvas[0], p3_canvas[1], p4_canvas[0], p4_canvas[1],
+                    fill="#FF4444", width=2, tags="measurement"
+                )
+            # 计算两直线交点（用于放置角度标注）
+            # 直线1: P1 + t*(P2-P1), 直线2: P3 + s*(P4-P3)
+            v1c = (dx1, dy1)
+            v2c = (dx2, dy2)
+            denom = v1c[0]*v2c[1] - v1c[1]*v2c[0]
+            if abs(denom) > 1e-10:
+                t = ((p3_canvas[0] - p1_canvas[0])*v2c[1] - (p3_canvas[1] - p1_canvas[1])*v2c[0]) / denom
+                intersect_x = p1_canvas[0] + t * v1c[0]
+                intersect_y = p1_canvas[1] + t * v1c[1]
+            else:
+                # 平行线 — 使用两直线中点
+                intersect_x = (p1_canvas[0] + p2_canvas[0] + p3_canvas[0] + p4_canvas[0]) / 4
+                intersect_y = (p1_canvas[1] + p2_canvas[1] + p3_canvas[1] + p4_canvas[1]) / 4
+            # 绘制角度弧线（在交点处）
+            arc_r = 25
+            angle1_rad = math.atan2(v1c[1], v1c[0])
+            angle2_rad = math.atan2(v2c[1], v2c[0])
+            # 修复弧线 extent 计算：使用标准化角度差确保弧线在较小角度内绘制
+            angle_diff = angle2_rad - angle1_rad
+            angle_diff_norm = angle_diff % (2 * math.pi)
+            if angle_diff_norm > math.pi:
+                angle_diff_norm -= 2 * math.pi
+            # extent 使用标准化后的角度差
+            arc_extent = math.degrees(angle_diff_norm)
+            arc_id = self.canvas.create_arc(
+                intersect_x - arc_r, intersect_y - arc_r,
+                intersect_x + arc_r, intersect_y + arc_r,
+                start=-math.degrees(angle1_rad), extent=-arc_extent,
+                outline="#FF4444", width=2, style=tk.ARC, tags="measurement"
+            )
+            # 标注文字放在角度内部（沿角平分线方向）
+            # 始终指向两条直线之间较小角度的内部
+            # 注意：atan2角度在画布坐标系中（y向下）是正确的方向，
+            # 但create_arc使用tkinter角度系统（逆时针），需要翻转
+            # 标注位置使用atan2的cos/sin是正确的（画布坐标系中y向下）
+            bisector_angle = angle1_rad + angle_diff_norm / 2
+            label_dist = arc_r * 0.7  # 标注在弧线内部
+            default_label_x = intersect_x + label_dist * math.cos(bisector_angle)
+            default_label_y = intersect_y + label_dist * math.sin(bisector_angle)
+            # 如果有 label_offset（用户拖拽过的偏移量），使用偏移位置
+            if self.measurements and self.measurements[-1].get("label_offset"):
+                offset = self.measurements[-1]["label_offset"]
+                label_x = default_label_x + offset[0]
+                label_y = default_label_y + offset[1]
+            else:
+                label_x = default_label_x
+                label_y = default_label_y
+            label_id = self.canvas.create_text(
+                label_x, label_y,
+                text=f"{value}{value_unit}",
+                fill="#FF4444", font=("", 10, "bold"), tags="measurement"
+            )
+            # 交点标记
+            r = 4
+            vertex_id = self.canvas.create_oval(
+                intersect_x - r, intersect_y - r, intersect_x + r, intersect_y + r,
+                fill="#FF6600", outline="white", width=1, tags="measurement"
+            )
+            # 确保所有绘制元素都添加到 canvas_ids（包括线、弧、标注、交点）
+            all_ids = [line1_id, line2_id, arc_id, label_id, vertex_id]
+            # 过滤掉可能的 None 值
+            all_ids = [cid for cid in all_ids if cid is not None]
+            if self.measurements:
+                self.measurements[-1]["canvas_ids"].extend(all_ids)
+
+        elif mode == "perimeter" and len(points) >= 3:
+            # 周长 — 多边形已绘制完成，添加标注文字
+            # 计算多边形重心作为标注位置
+            # 使用 _image_to_canvas_coords 从 img_xy 转换
+            canvas_pts = [self._image_to_canvas_coords(pt["img_xy"][0], pt["img_xy"][1]) for pt in points]
+            cx = sum(cp[0] for cp in canvas_pts) / len(canvas_pts)
+            cy = sum(cp[1] for cp in canvas_pts) / len(canvas_pts)
+            label_id = self.canvas.create_text(
+                cx, cy,
+                text=f"周长: {value} {value_unit}",
+                fill="#FF4444", font=("", 10, "bold"), tags="measurement"
+            )
+            if self.measurements:
+                self.measurements[-1]["canvas_ids"].append(label_id)
+
+        elif mode == "fit_circle" and len(points) >= 3:
+            # 拟合圆 — 绘制拟合圆 + 标注
+            import math as _m
+            # 使用原图坐标重新拟合圆心和半径
+            n = len(points)
+            sum_x = sum(pt["img_xy"][0] for pt in points)
+            sum_y = sum(pt["img_xy"][1] for pt in points)
+            sum_x2 = sum(pt["img_xy"][0]**2 for pt in points)
+            sum_y2 = sum(pt["img_xy"][1]**2 for pt in points)
+            sum_xy = sum(pt["img_xy"][0] * pt["img_xy"][1] for pt in points)
+            sum_x3 = sum(pt["img_xy"][0]**3 for pt in points)
+            sum_y3 = sum(pt["img_xy"][1]**3 for pt in points)
+            sum_x2y = sum(pt["img_xy"][0]**2 * pt["img_xy"][1] for pt in points)
+            sum_xy2 = sum(pt["img_xy"][0] * pt["img_xy"][1]**2 for pt in points)
+            M = [[sum_x2, sum_xy, sum_x], [sum_xy, sum_y2, sum_y], [sum_x, sum_y, n]]
+            P = [-(sum_x3 + sum_xy2), -(sum_x2y + sum_y3), -(sum_x2 + sum_y2)]
+            try:
+                det_M = (M[0][0]*(M[1][1]*M[2][2]-M[1][2]*M[2][1])
+                        - M[0][1]*(M[1][0]*M[2][2]-M[1][2]*M[2][0])
+                        + M[0][2]*(M[1][0]*M[2][1]-M[1][1]*M[2][0]))
+                if abs(det_M) < 1e-10:
+                    return
+                def _det3(a):
+                    return (a[0][0]*(a[1][1]*a[2][2]-a[1][2]*a[2][1])
+                           - a[0][1]*(a[1][0]*a[2][2]-a[1][2]*a[2][0])
+                           + a[0][2]*(a[1][0]*a[2][1]-a[1][1]*a[2][0]))
+                M1 = [[P[0], M[0][1], M[0][2]], [P[1], M[1][1], M[1][2]], [P[2], M[2][1], M[2][2]]]
+                M2 = [[M[0][0], P[0], M[0][2]], [M[1][0], P[1], M[1][2]], [M[2][0], P[2], M[2][2]]]
+                M3 = [[M[0][0], M[0][1], P[0]], [M[1][0], M[1][1], P[1]], [M[2][0], M[2][1], P[2]]]
+                A = _det3(M1) / det_M
+                B = _det3(M2) / det_M
+                C = _det3(M3) / det_M
+                img_cx = -A / 2
+                img_cy = -B / 2
+                img_r = _m.sqrt(img_cx*img_cx + img_cy*img_cy - C)
+                if img_r <= 0:
+                    return
+            except Exception:
+                return
+            # 转换圆心和半径到画布坐标
+            canvas_cx, canvas_cy = self._image_to_canvas_coords(img_cx, img_cy)
+            # 画布上的半径需要用圆心和一个边缘点的画布距离来计算
+            edge_pt_canvas = self._image_to_canvas_coords(points[0]["img_xy"][0], points[0]["img_xy"][1])
+            canvas_r = _m.sqrt((edge_pt_canvas[0] - canvas_cx)**2 + (edge_pt_canvas[1] - canvas_cy)**2)
+            # 绘制拟合圆
+            circle_id = self.canvas.create_oval(
+                canvas_cx - canvas_r, canvas_cy - canvas_r,
+                canvas_cx + canvas_r, canvas_cy + canvas_r,
+                outline="#FF4444", width=2, tags="measurement"
+            )
+            # 绘制圆心标记（十字）
+            cross_size = 6
+            cross_h = self.canvas.create_line(
+                canvas_cx - cross_size, canvas_cy, canvas_cx + cross_size, canvas_cy,
+                fill="#FF6600", width=2, tags="measurement"
+            )
+            cross_v = self.canvas.create_line(
+                canvas_cx, canvas_cy - cross_size, canvas_cx, canvas_cy + cross_size,
+                fill="#FF6600", width=2, tags="measurement"
+            )
+            # 标注文字（圆心上方，包含单位）
+            label_id = self.canvas.create_text(
+                canvas_cx, canvas_cy - canvas_r - 15,
+                text=f"{value} {value_unit}",
+                fill="#FF4444", font=("", 10, "bold"), tags="measurement"
+            )
+            if self.measurements:
+                self.measurements[-1]["canvas_ids"].extend([circle_id, cross_h, cross_v, label_id])
+                # 保存拟合圆心和半径到测量记录，用于重绘
+                self.measurements[-1]["fit_circle_data"] = {
+                    "img_cx": img_cx, "img_cy": img_cy, "img_r": img_r
+                }
+
+    def _update_measure_tree(self):
+        """更新测量结果 Treeview"""
+        self.measure_tree.delete(*self.measure_tree.get_children())
+        for m in self.measurements:
+            vis = "✅" if m["visible"] else "❌"
+            self.measure_tree.insert("", tk.END, iid=str(m["id"]), values=(
+                f"#{m['id']}", m["name"], m["type_name"], f"{m['value']} {m['value_unit']}", vis
+            ))
+        self.measure_count_var.set(f"累计测量: {len(self.measurements)} 个")
+
+    def _on_measure_select(self, event):
+        """选中测量结果时高亮对应的画布元素"""
+        sel = self.measure_tree.selection()
+        if not sel:
+            return
+        # 暂不实现画布高亮（与 ROI 选中行为类似可后续添加）
+
+    def _on_measure_double_click(self, event):
+        """双击测量结果编辑名字"""
+        sel = self.measure_tree.selection()
+        if not sel:
+            return
+        item_id = sel[0]
+        measure_data = None
+        for m in self.measurements:
+            if str(m["id"]) == item_id:
+                measure_data = m
+                break
+        if not measure_data:
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("编辑名字")
+        dialog.geometry("300x100")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        ttk.Label(dialog, text=f"编辑 {measure_data['name']} 的名字:").pack(pady=(10, 4))
+        name_var = tk.StringVar(value=measure_data["name"])
+        entry = ttk.Entry(dialog, textvariable=name_var, width=30)
+        entry.pack(pady=4)
+        entry.select_range(0, tk.END)
+        entry.focus()
+
+        def confirm():
+            measure_data["name"] = name_var.get().strip() or measure_data["name"]
+            self._update_measure_tree()
+            dialog.destroy()
+
+        entry.bind("<Return>", lambda e: confirm())
+        ttk.Button(dialog, text="确定", command=confirm).pack(pady=4)
+
+    def _on_measure_click(self, event):
+        """点击测量列表 — 点击可见列切换可见性"""
+        region = self.measure_tree.identify_region(event.x, event.y)
+        if region != "cell":
+            return
+        column = self.measure_tree.identify_column(event.x)
+        if column != "#5":  # visible column (1-based: #1=id, #2=name, #3=type, #4=value, #5=vis)
+            return
+        row = self.measure_tree.identify_row(event.y)
+        if not row:
+            return
+        for m in self.measurements:
+            if str(m["id"]) == row:
+                m["visible"] = not m["visible"]
+                # 更新画布元素可见性（过滤None值）
+                for cid in m["canvas_ids"]:
+                    if cid is None:
+                        continue
+                    if m["visible"]:
+                        self.canvas.itemconfigure(cid, state=tk.NORMAL)
+                    else:
+                        self.canvas.itemconfigure(cid, state=tk.HIDDEN)
+                self._update_measure_tree()
+                self.measure_tree.selection_set(row)
+                break
+
+    def _toggle_selected_measure_visibility(self):
+        """切换选中测量结果的可见性"""
+        sel = self.measure_tree.selection()
+        if not sel:
+            return
+        for item_id in sel:
+            for m in self.measurements:
+                if str(m["id"]) == item_id:
+                    m["visible"] = not m["visible"]
+                    for cid in m["canvas_ids"]:
+                        if cid is None:
+                            continue
+                        if m["visible"]:
+                            self.canvas.itemconfigure(cid, state=tk.NORMAL)
+                        else:
+                            self.canvas.itemconfigure(cid, state=tk.HIDDEN)
+                    break
+        self._update_measure_tree()
+
+    def _delete_selected_measure(self):
+        """删除选中的测量结果"""
+        sel = self.measure_tree.selection()
+        if not sel:
+            return
+        for item_id in sel:
+            for m in self.measurements:
+                if str(m["id"]) == item_id:
+                    # 删除画布元素（过滤None值）
+                    for cid in m["canvas_ids"]:
+                        if cid is not None:
+                            self.canvas.delete(cid)
+                    self.measurements.remove(m)
+                    break
+        self._update_measure_tree()
+        self._set_status("📐 已删除选中测量结果")
+
+    def _clear_all_measurements(self):
+        """清空所有测量结果"""
+        if not self.measurements:
+            return
+        # 确认对话框
+        if not messagebox.askyesno("确认", "确定要清空所有测量结果吗？"):
+            return
+        for m in self.measurements:
+            for cid in m["canvas_ids"]:
+                if cid is not None:
+                    self.canvas.delete(cid)
+        self.measurements = []
+        self._clear_measure_temp()
+        self._update_measure_tree()
+        self._set_status("📐 已清空所有测量结果")
+
+    def _hide_all_measurements(self):
+        """隐藏所有测量结果"""
+        for m in self.measurements:
+            m["visible"] = False
+            for cid in m["canvas_ids"]:
+                if cid is not None:
+                    self.canvas.itemconfigure(cid, state=tk.HIDDEN)
+        self._update_measure_tree()
+
+    def _export_measurements(self):
+        """导出测量结果到 CSV"""
+        if not self.measurements:
+            messagebox.showinfo("提示", "没有测量结果可导出")
+            return
+
+        import csv
+        image_dir = os.path.dirname(self.image_path) if self.image_path else os.path.expanduser("~")
+        base_name = os.path.splitext(os.path.basename(self.image_path))[0] if self.image_path else "measurements"
+
+        csv_path = filedialog.asksaveasfilename(
+            title="导出测量结果",
+            initialdir=image_dir,
+            initialfile=f"{base_name}_measurements.csv",
+            defaultextension=".csv",
+            filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")]
+        )
+        if not csv_path:
+            return
+
+        try:
+            with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                # 写入表头
+                writer.writerow(["ID", "名字", "类型", "测量值", "单位", "点坐标(原图)", "可见"])
+                # 写入数据
+                for m in self.measurements:
+                    points_str = "; ".join([f"({pt['img_xy'][0]:.1f}, {pt['img_xy'][1]:.1f})" for pt in m["points"]])
+                    writer.writerow([
+                        m["id"], m["name"], m["type_name"], m["value"], m["value_unit"],
+                        points_str, "是" if m["visible"] else "否"
+                    ])
+
+            messagebox.showinfo("导出完成", f"已导出 {len(self.measurements)} 条测量结果到:\n{csv_path}")
+            self._set_status(f"📊 已导出测量结果到 {csv_path}")
+        except Exception as e:
+            messagebox.showerror("导出失败", f"导出测量结果时出错:\n{e}")
+            self._set_status(f"❌ 导出测量结果失败: {e}")
+
+    def _redraw_all_measurements(self):
+        """重绘所有测量结果（在缩放/平移后需要重新绘制）"""
+        # 删除所有测量画布元素
+        self.canvas.delete("measurement")
+        # 重新绘制每条测量记录
+        for m in self.measurements:
+            m["canvas_ids"] = []
+            # 重新绘制点标记（长度测量不绘制圆点，只用tick须线）
+            if m["type"] != "length":
+                for pt in m["points"]:
+                    cx, cy = self._image_to_canvas_coords(pt["img_xy"][0], pt["img_xy"][1])
+                    r = 5
+                    pt_id = self.canvas.create_oval(
+                        cx - r, cy - r, cx + r, cy + r,
+                        fill="#FF4444", outline="white", width=1, tags="measurement"
+                    )
+                    m["canvas_ids"].append(pt_id)
+
+            # 重新绘制线段和标注
+            if m["type"] == "length":
+                p1 = m["points"][0]["img_xy"]
+                p2 = m["points"][1]["img_xy"]
+                c1 = self._image_to_canvas_coords(p1[0], p1[1])
+                c2 = self._image_to_canvas_coords(p2[0], p2[1])
+                line_id = self.canvas.create_line(
+                    c1[0], c1[1], c2[0], c2[1],
+                    fill="#FF4444", width=2, tags="measurement"
+                )
+                # 须线（tick marks）— 长度测量只用tick标注，不绘制圆点
+                dx = c2[0] - c1[0]
+                dy = c2[1] - c1[1]
+                line_len = math.sqrt(dx*dx + dy*dy)
+                tick_ids = []
+                if line_len > 0:
+                    nx = -dy / line_len
+                    ny = dx / line_len
+                    tick_len = 8
+                    tick1_id = self.canvas.create_line(
+                        c1[0] + nx*tick_len, c1[1] + ny*tick_len,
+                        c1[0] - nx*tick_len, c1[1] - ny*tick_len,
+                        fill="#FF4444", width=2, tags="measurement"
+                    )
+                    tick2_id = self.canvas.create_line(
+                        c2[0] + nx*tick_len, c2[1] + ny*tick_len,
+                        c2[0] - nx*tick_len, c2[1] - ny*tick_len,
+                        fill="#FF4444", width=2, tags="measurement"
+                    )
+                    tick_ids = [tick1_id, tick2_id]
+                mid_x = (c1[0] + c2[0]) / 2
+                mid_y = (c1[1] + c2[1]) / 2
+                label_id = self.canvas.create_text(
+                    mid_x, mid_y - 12,
+                    text=f"{m['value']} {m['value_unit']}",
+                    fill="#FF4444", font=("", 10, "bold"), tags="measurement"
+                )
+                m["canvas_ids"].extend([line_id] + tick_ids + [label_id])
+
+            elif m["type"] == "angle":
+                p1 = m["points"][0]["img_xy"]       # 边缘点1
+                p2 = m["points"][1]["img_xy"]        # 顶点
+                p3 = m["points"][2]["img_xy"]        # 边缘点2
+                c1 = self._image_to_canvas_coords(p1[0], p1[1])
+                c2 = self._image_to_canvas_coords(p2[0], p2[1])
+                c3 = self._image_to_canvas_coords(p3[0], p3[1])
+                line1_id = self.canvas.create_line(
+                    c2[0], c2[1], c1[0], c1[1],
+                    fill="#FF4444", width=2, tags="measurement"
+                )
+                line2_id = self.canvas.create_line(
+                    c2[0], c2[1], c3[0], c3[1],
+                    fill="#FF4444", width=2, tags="measurement"
+                )
+                arc_r = 25
+                v1 = (c1[0] - c2[0], c1[1] - c2[1])
+                v2 = (c3[0] - c2[0], c3[1] - c2[1])
+                angle1 = math.atan2(v1[1], v1[0])
+                angle2 = math.atan2(v2[1], v2[0])
+                # 修复弧线 extent 计算
+                angle_diff = angle2 - angle1
+                angle_diff_norm = angle_diff % (2 * math.pi)
+                if angle_diff_norm > math.pi:
+                    angle_diff_norm -= 2 * math.pi
+                arc_extent = math.degrees(angle_diff_norm)
+                arc_id = self.canvas.create_arc(
+                    c2[0] - arc_r, c2[1] - arc_r, c2[0] + arc_r, c2[1] + arc_r,
+                    start=-math.degrees(angle1), extent=-arc_extent,
+                    outline="#FF4444", width=2, style=tk.ARC, tags="measurement"
+                )
+                # 标注文字放在角度内部（沿角平分线方向）
+                bisector_angle = angle1 + angle_diff_norm / 2
+                label_dist = arc_r * 0.7  # 标注文字在弧线内部
+                default_label_x = c2[0] + label_dist * math.cos(bisector_angle)
+                default_label_y = c2[1] + label_dist * math.sin(bisector_angle)
+                # 如果有 label_offset（用户拖拽过的偏移量），使用偏移位置
+                if m.get("label_offset"):
+                    offset = m["label_offset"]
+                    label_x = default_label_x + offset[0]
+                    label_y = default_label_y + offset[1]
+                else:
+                    label_x = default_label_x
+                    label_y = default_label_y
+                label_id = self.canvas.create_text(
+                    label_x, label_y,
+                    text=f"{m['value']}{m['value_unit']}",
+                    fill="#FF4444", font=("", 10, "bold"), tags="measurement"
+                )
+                r = 5
+                vertex_id = self.canvas.create_oval(
+                    c2[0] - r, c2[1] - r, c2[0] + r, c2[1] + r,
+                    fill="#FF6600", outline="white", width=1, tags="measurement"
+                )
+                all_ids = [line1_id, line2_id, arc_id, label_id, vertex_id]
+                all_ids = [cid for cid in all_ids if cid is not None]
+                m["canvas_ids"].extend(all_ids)
+
+            elif m["type"] == "angle_4pt":
+                # 4点角度重绘
+                p1 = m["points"][0]["img_xy"]  # 直线1点1
+                p2 = m["points"][1]["img_xy"]  # 直线1点2
+                p3 = m["points"][2]["img_xy"]  # 直线2点1
+                p4 = m["points"][3]["img_xy"]  # 直线2点2
+                c1 = self._image_to_canvas_coords(p1[0], p1[1])
+                c2 = self._image_to_canvas_coords(p2[0], p2[1])
+                c3 = self._image_to_canvas_coords(p3[0], p3[1])
+                c4 = self._image_to_canvas_coords(p4[0], p4[1])
+                # 直线1（延长线）
+                dx1 = c2[0] - c1[0]
+                dy1 = c2[1] - c1[1]
+                len1 = math.sqrt(dx1*dx1 + dy1*dy1)
+                if len1 > 0:
+                    ext1 = 50
+                    ux1, uy1 = dx1/len1, dy1/len1
+                    line1_id = self.canvas.create_line(
+                        c1[0] - ux1*ext1, c1[1] - uy1*ext1,
+                        c2[0] + ux1*ext1, c2[1] + uy1*ext1,
+                        fill="#FF4444", width=2, tags="measurement"
+                    )
+                else:
+                    line1_id = self.canvas.create_line(c1[0], c1[1], c2[0], c2[1],
+                        fill="#FF4444", width=2, tags="measurement")
+                # 直线2（延长线）
+                dx2 = c4[0] - c3[0]
+                dy2 = c4[1] - c3[1]
+                len2 = math.sqrt(dx2*dx2 + dy2*dy2)
+                if len2 > 0:
+                    ext2 = 50
+                    ux2, uy2 = dx2/len2, dy2/len2
+                    line2_id = self.canvas.create_line(
+                        c3[0] - ux2*ext2, c3[1] - uy2*ext2,
+                        c4[0] + ux2*ext2, c4[1] + uy2*ext2,
+                        fill="#FF4444", width=2, tags="measurement"
+                    )
+                else:
+                    line2_id = self.canvas.create_line(c3[0], c3[1], c4[0], c4[1],
+                        fill="#FF4444", width=2, tags="measurement")
+                # 交点
+                v1c = (dx1, dy1)
+                v2c = (dx2, dy2)
+                denom = v1c[0]*v2c[1] - v1c[1]*v2c[0]
+                if abs(denom) > 1e-10:
+                    t = ((c3[0] - c1[0])*v2c[1] - (c3[1] - c1[1])*v2c[0]) / denom
+                    ix = c1[0] + t * v1c[0]
+                    iy = c1[1] + t * v1c[1]
+                else:
+                    ix = (c1[0] + c2[0] + c3[0] + c4[0]) / 4
+                    iy = (c1[1] + c2[1] + c3[1] + c4[1]) / 4
+                # 角度弧线
+                arc_r = 25
+                angle1_rad = math.atan2(v1c[1], v1c[0])
+                angle2_rad = math.atan2(v2c[1], v2c[0])
+                # 修复弧线 extent 计算
+                angle_diff = angle2_rad - angle1_rad
+                angle_diff_norm = angle_diff % (2 * math.pi)
+                if angle_diff_norm > math.pi:
+                    angle_diff_norm -= 2 * math.pi
+                arc_extent = math.degrees(angle_diff_norm)
+                arc_id = self.canvas.create_arc(
+                    ix - arc_r, iy - arc_r, ix + arc_r, iy + arc_r,
+                    start=-math.degrees(angle1_rad), extent=-arc_extent,
+                    outline="#FF4444", width=2, style=tk.ARC, tags="measurement"
+                )
+                # 标注文字放在角度内部（沿角平分线方向，从交点出发）
+                # 使用从交点到直线1/2上最近点的方向，而不是直线方向向量
+                dir1_angle = math.atan2(c2[1] - iy, c2[0] - ix)
+                dir2_angle = math.atan2(c3[1] - iy, c3[0] - ix)
+                angle_diff_dir = dir2_angle - dir1_angle
+                angle_diff_norm_dir = angle_diff_dir % (2 * math.pi)
+                if angle_diff_norm_dir > math.pi:
+                    angle_diff_norm_dir -= 2 * math.pi
+                bisector_angle = dir1_angle + angle_diff_norm_dir / 2 + math.pi / 2  # 逆时针旋转90度
+                label_dist = arc_r * 0.7  # 标注在弧线内部
+                default_label_x = ix + label_dist * math.cos(bisector_angle)
+                default_label_y = iy + label_dist * math.sin(bisector_angle)
+                # 如果有 label_offset（用户拖拽过的偏移量），使用偏移位置
+                if m.get("label_offset"):
+                    offset = m["label_offset"]
+                    label_x = default_label_x + offset[0]
+                    label_y = default_label_y + offset[1]
+                else:
+                    label_x = default_label_x
+                    label_y = default_label_y
+                label_id = self.canvas.create_text(
+                    label_x, label_y,
+                    text=f"{m['value']}{m['value_unit']}",
+                    fill="#FF4444", font=("", 10, "bold"), tags="measurement"
+                )
+                # 交点标记
+                r = 4
+                vertex_id = self.canvas.create_oval(
+                    ix - r, iy - r, ix + r, iy + r,
+                    fill="#FF6600", outline="white", width=1, tags="measurement"
+                )
+                # 确保所有绘制元素都添加到 canvas_ids
+                all_ids = [line1_id, line2_id, arc_id, label_id, vertex_id]
+                all_ids = [cid for cid in all_ids if cid is not None]
+                m["canvas_ids"].extend(all_ids)
+
+            elif m["type"] == "perimeter":
+                # 绘制多边形线段
+                for i in range(len(m["points"])):
+                    p1 = m["points"][i]["img_xy"]
+                    p2 = m["points"][(i + 1) % len(m["points"])]["img_xy"]
+                    c1 = self._image_to_canvas_coords(p1[0], p1[1])
+                    c2 = self._image_to_canvas_coords(p2[0], p2[1])
+                    line_id = self.canvas.create_line(
+                        c1[0], c1[1], c2[0], c2[1],
+                        fill="#FF4444", width=2, tags="measurement"
+                    )
+                    m["canvas_ids"].append(line_id)
+                # 标注文字
+                cx = sum(self._image_to_canvas_coords(pt["img_xy"][0], pt["img_xy"][1])[0] for pt in m["points"]) / len(m["points"])
+                cy = sum(self._image_to_canvas_coords(pt["img_xy"][0], pt["img_xy"][1])[1] for pt in m["points"]) / len(m["points"])
+                label_id = self.canvas.create_text(
+                    cx, cy,
+                    text=f"周长: {m['value']} {m['value_unit']}",
+                    fill="#FF4444", font=("", 10, "bold"), tags="measurement"
+                )
+                m["canvas_ids"].append(label_id)
+
+            elif m["type"] == "fit_circle":
+                # 拟合圆重绘 — 使用保存的拟合圆心和半径
+                fit_data = m.get("fit_circle_data")
+                if fit_data:
+                    img_cx = fit_data["img_cx"]
+                    img_cy = fit_data["img_cy"]
+                    img_r = fit_data["img_r"]
+                    canvas_cx, canvas_cy = self._image_to_canvas_coords(img_cx, img_cy)
+                    # 画布上的半径
+                    edge_pt = m["points"][0]["img_xy"]
+                    edge_canvas = self._image_to_canvas_coords(edge_pt[0], edge_pt[1])
+                    canvas_r = math.sqrt((edge_canvas[0] - canvas_cx)**2 + (edge_canvas[1] - canvas_cy)**2)
+                    # 绘制拟合圆
+                    circle_id = self.canvas.create_oval(
+                        canvas_cx - canvas_r, canvas_cy - canvas_r,
+                        canvas_cx + canvas_r, canvas_cy + canvas_r,
+                        outline="#FF4444", width=2, tags="measurement"
+                    )
+                    # 绘制圆心十字标记
+                    cross_size = 6
+                    cross_h = self.canvas.create_line(
+                        canvas_cx - cross_size, canvas_cy, canvas_cx + cross_size, canvas_cy,
+                        fill="#FF6600", width=2, tags="measurement"
+                    )
+                    cross_v = self.canvas.create_line(
+                        canvas_cx, canvas_cy - cross_size, canvas_cx, canvas_cy + cross_size,
+                        fill="#FF6600", width=2, tags="measurement"
+                    )
+                    # 标注文字（包含单位）
+                    label_id = self.canvas.create_text(
+                        canvas_cx, canvas_cy - canvas_r - 15,
+                        text=f"{m['value']} {m['value_unit']}",
+                        fill="#FF4444", font=("", 10, "bold"), tags="measurement"
+                    )
+                    m["canvas_ids"].extend([circle_id, cross_h, cross_v, label_id])
+
+            # 设置可见性
+            if not m["visible"]:
+                for cid in m["canvas_ids"]:
+                    self.canvas.itemconfigure(cid, state=tk.HIDDEN)
+
+    # ================================================================
     #  提示点管理
     # ================================================================
 
@@ -3947,6 +5745,32 @@ class SAM3App:
                     }
                     zf.writestr("calibration/calibration.json", json.dumps(calib_meta, ensure_ascii=False, indent=2))
 
+                # 7. 保存测量数据
+                measurements_meta = {
+                    "measurements": [
+                        {
+                            "id": m.get("id"),
+                            "name": m.get("name"),
+                            "type": m.get("type"),
+                            "type_name": m.get("type_name"),
+                            "value": m.get("value"),
+                            "value_unit": m.get("value_unit"),
+                            "points": [
+                                {"img_xy": p.get("img_xy"), "label": p.get("label")}
+                                for p in m.get("points", [])
+                            ],
+                            "label_offset": m.get("label_offset"),
+                            "fit_circle_data": m.get("fit_circle_data"),
+                            "visible": m.get("visible", True),
+                        }
+                        for m in self.measurements
+                    ],
+                    "measure_counter": self.measure_counter,
+                    "length_unit": self.length_unit_var.get() if hasattr(self, "length_unit_var") else "px",
+                    "angle_unit": self.angle_unit_var.get() if hasattr(self, "angle_unit_var") else "°",
+                }
+                zf.writestr("measurements/measurements_meta.json", json.dumps(measurements_meta, ensure_ascii=False, indent=2))
+
             total_items = len(self.segmentation_results) + len(self.roi_list)
             self._set_status(f"项目已保存: {proj_path}")
             messagebox.showinfo(
@@ -4009,6 +5833,11 @@ class SAM3App:
                 self.roi_counter = 0
                 self.click_point_list = []
                 self.click_point_counter = 0
+                # ── 清除旧的测量结果 ──
+                self.canvas.delete("measurement")
+                self.measurements = []
+                self.measure_counter = 0
+                self._update_measure_tree()
                 self._load_image_from_path(img_path_to_load)
 
                 # 3. 恢复模型路径
@@ -4150,6 +5979,33 @@ class SAM3App:
                     self.calib_info_var.set("⚠️ 未校准")
                     self._on_unit_change()
 
+                # 8. 恢复测量数据
+                if "measurements/measurements_meta.json" in zf.namelist():
+                    meas_meta = json.loads(zf.read("measurements/measurements_meta.json"))
+                    raw_measurements = meas_meta.get("measurements", [])
+                    # 补充缺失字段（兼容旧版本项目文件）
+                    for m in raw_measurements:
+                        if "visible" not in m:
+                            m["visible"] = True
+                        if "name" not in m:
+                            m["name"] = f"Measure_{m.get('id', 0)}"
+                        if "type_name" not in m:
+                            m["type_name"] = m.get("type", "")
+                        if "label_offset" not in m:
+                            m["label_offset"] = None
+                        if "canvas_ids" not in m:
+                            m["canvas_ids"] = []
+                    self.measurements = raw_measurements
+                    self.measure_counter = meas_meta.get("measure_counter", 0)
+                    # 恢复长度和角度单位
+                    if hasattr(self, 'length_unit_var'):
+                        self.length_unit_var.set(meas_meta.get("length_unit", "px"))
+                    if hasattr(self, 'angle_unit_var'):
+                        self.angle_unit_var.set(meas_meta.get("angle_unit", "°"))
+                    # 重绘所有测量标注
+                    self._redraw_all_measurements()
+                    self._update_measure_tree()
+
             roi_count = len(self.roi_list) if hasattr(self, 'roi_list') else 0
             point_count = len(self.click_point_list) if hasattr(self, 'click_point_list') else 0
             self._set_status(
@@ -4201,6 +6057,11 @@ class SAM3App:
                 self.roi_counter = 0
                 self.click_point_list = []
                 self.click_point_counter = 0
+                # ── 清除旧的测量结果 ──
+                self.canvas.delete("measurement")
+                self.measurements = []
+                self.measure_counter = 0
+                self._update_measure_tree()
                 self._load_image_from_path(img_path_to_load)
 
                 # 3. 恢复模型路径
@@ -4332,6 +6193,33 @@ class SAM3App:
                     # 项目没有校准数据，确保显示 ⚠️ 未校准
                     self.calib_info_var.set("⚠️ 未校准")
                     self._on_unit_change()
+
+                # 8. 恢复测量数据
+                if "measurements/measurements_meta.json" in zf.namelist():
+                    meas_meta = json.loads(zf.read("measurements/measurements_meta.json"))
+                    raw_measurements = meas_meta.get("measurements", [])
+                    # 补充缺失字段（兼容旧版本项目文件）
+                    for m in raw_measurements:
+                        if "visible" not in m:
+                            m["visible"] = True
+                        if "name" not in m:
+                            m["name"] = f"Measure_{m.get('id', 0)}"
+                        if "type_name" not in m:
+                            m["type_name"] = m.get("type", "")
+                        if "label_offset" not in m:
+                            m["label_offset"] = None
+                        if "canvas_ids" not in m:
+                            m["canvas_ids"] = []
+                    self.measurements = raw_measurements
+                    self.measure_counter = meas_meta.get("measure_counter", 0)
+                    # 恢复长度和角度单位
+                    if hasattr(self, 'length_unit_var'):
+                        self.length_unit_var.set(meas_meta.get("length_unit", "px"))
+                    if hasattr(self, 'angle_unit_var'):
+                        self.angle_unit_var.set(meas_meta.get("angle_unit", "°"))
+                    # 重绘所有测量标注
+                    self._redraw_all_measurements()
+                    self._update_measure_tree()
 
             roi_count = len(self.roi_list) if hasattr(self, 'roi_list') else 0
             point_count = len(self.click_point_list) if hasattr(self, 'click_point_list') else 0
