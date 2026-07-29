@@ -14,6 +14,7 @@ torch_hiddenimports = collect_submodules('torch')
 sam_hiddenimports = collect_submodules('segment_anything')
 dnd_hiddenimports = collect_submodules('tkinterdnd2')
 ultra_hiddenimports = collect_submodules('ultralytics')
+sam3_hiddenimports = collect_submodules('sam3')
 
 # Auto-select icon based on platform
 icon_file = 'icon.ico' if sys.platform == 'win32' else 'icon.icns'
@@ -24,7 +25,7 @@ a = Analysis(
     binaries=[],
     datas=[
         ('sam3_engine.py', '.'),
-    ] + collect_data_files('torch') + collect_data_files('segment_anything') + collect_data_files('tkinterdnd2') + collect_data_files('ultralytics'),
+    ] + collect_data_files('torch') + collect_data_files('segment_anything') + collect_data_files('tkinterdnd2') + collect_data_files('ultralytics') + collect_data_files('sam3'),
     hiddenimports=[
         'sam3_engine',
         'tkinterdnd2',
@@ -33,9 +34,10 @@ a = Analysis(
         'torchvision',
         'segment_anything',
         'ultralytics',
+        'sam3',
         'numpy',
         'PIL',
-    ] + torch_hiddenimports + sam_hiddenimports + dnd_hiddenimports + ultra_hiddenimports,
+    ] + torch_hiddenimports + sam_hiddenimports + dnd_hiddenimports + ultra_hiddenimports + sam3_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
