@@ -1,6 +1,8 @@
-numpy
-Pillow
-tkinterdnd2
 torch
+torchvision
 segment-anything
 ultralytics
+sam3
+tkinterdnd2
+numpy
+Pillow
